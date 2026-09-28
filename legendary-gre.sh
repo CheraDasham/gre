@@ -212,6 +212,26 @@ else
     ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
 fi
 
+# The kernel keys GRE tunnels on (local, remote, key) -- NOT on the interface
+# name. If another GRE tunnel already uses this exact pair of endpoints, the
+# add fails with EEXIST and, confusingly, reports the fallback device "gre0"
+# rather than the name that was asked for. Everything after that would fail
+# with "Cannot find device", so stop here instead of claiming success.
+if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+    echo "[legendary-gre] ERROR: interface $TUN_NAME was not created." >&2
+    echo >&2
+    echo "  Most likely another GRE tunnel already uses the same endpoints" >&2
+    echo "  ($LOCAL_IP -> $REMOTE_IP). The kernel allows only one GRE tunnel" >&2
+    echo "  per local/remote pair, whatever the interface is called." >&2
+    echo >&2
+    echo "  Existing GRE tunnels on this server:" >&2
+    ip -d tunnel show 2>/dev/null | grep -i 'gre' | sed 's/^/    /' >&2 || true
+    echo >&2
+    echo "  Delete the conflicting one, then run this again:" >&2
+    echo "    ip tunnel del <name>" >&2
+    exit 1
+fi
+
 ip link set "$TUN_NAME" mtu "$MTU" 2>/dev/null || true
 ip link set "$TUN_NAME" txqueuelen 2000 2>/dev/null || true
 ip link set "$TUN_NAME" up
@@ -440,6 +460,36 @@ create_tunnel() {
         echo "IP that does not show up in 'ip addr' (space separated, or leave empty)."
         read -rp "Extra public IPs []: " extra
         EXTRA_PUBLIC_IPS="$extra"
+    fi
+
+    # A GRE tunnel is identified by its endpoints, not its name. Another tunnel
+    # on the same local/remote pair -- typically one left over from a different
+    # script -- makes the kernel refuse this one with EEXIST. Catch it here,
+    # while it is still cheap to fix.
+    local conflict yn2
+    conflict="$(ip -d tunnel show 2>/dev/null \
+        | grep -i 'gre' \
+        | grep -F "remote $REMOTE_IP" \
+        | grep -F "local $LOCAL_IP" \
+        | grep -v "^${TUN_NAME}:" || true)"
+    if [ -n "$conflict" ]; then
+        echo
+        echo "[!] Another GRE tunnel already uses these endpoints:"
+        printf '      %s\n' "$conflict"
+        echo "    The kernel allows only one GRE tunnel per local/remote pair,"
+        echo "    so this one cannot be created until that one is gone."
+        echo
+        read -rp "Delete the conflicting tunnel now? [y/N]: " yn2
+        if [[ "${yn2:-N}" =~ ^[Yy]$ ]]; then
+            printf '%s\n' "$conflict" | awk -F: '{print $1}' | while read -r old; do
+                [ -n "$old" ] || continue
+                echo "    removing $old"
+                ip tunnel del "$old" 2>/dev/null || ip link del "$old" 2>/dev/null || true
+            done
+        else
+            echo "Aborted. Remove it yourself with:  ip tunnel del <name>"
+            return 0
+        fi
     fi
 
     save_state
