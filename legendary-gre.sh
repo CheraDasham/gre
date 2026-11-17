@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Legendary GRE Tunnel Manager  (v1.1.1)
+# Legendary GRE Tunnel Manager  (v1.1.2)
 # IRAN <-> FOREIGN GRE tunnel with REAL CLIENT IP preservation.
 #
 # Copyright (C) 2026 Legendary
@@ -36,7 +36,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 
 trap 'rc=$?; echo; echo "[!] ERROR (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -63,6 +63,12 @@ SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 TAG_PREFIX="LEGENDARY_GRE_"
 SYS_TAG="${TAG_PREFIX}SYS"
 PF_TAG="${TAG_PREFIX}PF"
+
+# Stamped into the generated helper scripts so a newer legendary-gre.sh can
+# tell that the ones on disk were written by an older version. Without this,
+# upgrading the script leaves stale helpers in /usr/local/sbin that keep
+# running the old logic -- and the symptoms show up far from the cause.
+HELPER_STAMP="# LEGENDARY_GRE_HELPER_VERSION=$VERSION"
 
 DEFAULT_TUN_NAME="legend0"
 DEFAULT_TUN_NET="10.10.10.0/30"
@@ -173,8 +179,13 @@ remove_tagged_rules() {
 # ------------------------------------------------------------- up script ---
 
 write_up_script() {
-    cat > "$UP_SCRIPT" <<'UPEOF'
+    # Shebang first, then the version stamp, then the body. The stamp is what
+    # lets a newer legendary-gre.sh notice that the helper on disk is stale.
+    cat > "$UP_SCRIPT" <<UPSTAMP
 #!/bin/bash
+$HELPER_STAMP
+UPSTAMP
+    cat >> "$UP_SCRIPT" <<'UPEOF'
 # Applied at boot and after every config change by legendary-gre.sh.
 # Fully idempotent: safe to run any number of times.
 # Deliberately NOT "set -e" -- one failing rule must not skip the rest.
@@ -346,8 +357,11 @@ UPEOF
 }
 
 write_down_script() {
-    cat > "$DOWN_SCRIPT" <<'DOWNEOF'
+    cat > "$DOWN_SCRIPT" <<DOWNSTAMP
 #!/bin/bash
+$HELPER_STAMP
+DOWNSTAMP
+    cat >> "$DOWN_SCRIPT" <<'DOWNEOF'
 # Tears the tunnel down. Run by "systemctl stop legendary-gre".
 set -uo pipefail
 
@@ -1005,4 +1019,30 @@ main_menu() {
     done
 }
 
+# An upgrade only replaces this file. The helper scripts it generated live in
+# /usr/local/sbin and keep whatever logic the old version wrote, so a new
+# feature here would silently run against old logic there. Refresh them before
+# the menu opens if their stamp does not match this version.
+ensure_helpers_current() {
+    [ -f "$STATE_FILE" ] || return 0
+
+    local stale=0
+    grep -qxF "$HELPER_STAMP" "$UP_SCRIPT" 2>/dev/null || stale=1
+    grep -qxF "$HELPER_STAMP" "$DOWN_SCRIPT" 2>/dev/null || stale=1
+    [ "$stale" -eq 1 ] || return 0
+
+    echo "[i] Helper scripts on disk are from an older version - regenerating for v$VERSION."
+    write_up_script
+    write_down_script
+    write_service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if "$UP_SCRIPT" >/dev/null 2>&1; then
+        echo "[i] Done. Existing tunnel and port-forwards re-applied."
+    else
+        echo "[!] Regenerated, but re-applying failed. Run option 3 (Diagnose)."
+    fi
+    echo
+}
+
+ensure_helpers_current
 main_menu
