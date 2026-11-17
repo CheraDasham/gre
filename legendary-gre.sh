@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Legendary GRE Tunnel Manager  (v1.1)
+# Legendary GRE Tunnel Manager  (v1.1.1)
 # IRAN <-> FOREIGN GRE tunnel with REAL CLIENT IP preservation.
 #
 # Copyright (C) 2026 Legendary
@@ -36,7 +36,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1"
+VERSION="1.1.1"
 
 trap 'rc=$?; echo; echo "[!] ERROR (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -120,6 +120,29 @@ detect_local_ip() {
 
 ip_is_local() {
     ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -qx "$1"
+}
+
+# The public entry-point addresses of this server: the addresses on whichever
+# interface carries the default route, plus anything in EXTRA_PUBLIC_IPS. That
+# excludes docker bridges, other tunnels and private ranges by construction.
+#
+# This has to exist here as well as inside the generated up-script. The two
+# must agree, because this one builds the list the operator picks from and
+# that one builds the rules from the picked value.
+public_ips() {
+    local wan
+    wan="$(ip route show default 2>/dev/null | \
+        awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    {
+        if [ -n "$wan" ]; then
+            ip -4 -o addr show dev "$wan" scope global 2>/dev/null | \
+                awk '{split($4,a,"/"); print a[1]}'
+        fi
+        if [ -n "${EXTRA_PUBLIC_IPS:-}" ]; then
+            printf '%s\n' $EXTRA_PUBLIC_IPS
+        fi
+    } | awk 'NF && !seen[$0]++'
+    return 0
 }
 
 # Remove every iptables rule whose comment starts with the given tag.
@@ -736,7 +759,12 @@ add_port_forward() {
     done < <(public_ips)
 
     bindip=""
-    if [ "${#ips[@]}" -gt 1 ]; then
+    if [ "${#ips[@]}" -eq 0 ]; then
+        echo
+        echo "[!] Could not read this server's public addresses, so there is"
+        echo "    nothing to choose from. The forward will be published on"
+        echo "    every public address. Check 'ip route show default'."
+    elif [ "${#ips[@]}" -gt 1 ]; then
         echo
         echo "This server has more than one public address."
         echo "  0) all of them"
