@@ -253,6 +253,10 @@ sudo ./legendary-gre.sh
 
 ## Changelog
 
+**v1.1.1**
+- Fixed `public_ips: command not found` when adding a port forward. The helper existed only inside the generated up-script, so the menu never showed the address picker and every forward silently landed on all addresses.
+- Warn instead of silently defaulting to "all" when the address list cannot be read.
+
 **v1.1**
 - Port forwards can be bound to a single public IP on a multi-IP server; `0) all of them` keeps the previous behaviour.
 - Forwards are listed with an index and removed by index, since a port is no longer unique on its own.
