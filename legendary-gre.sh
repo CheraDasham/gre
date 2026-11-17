@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Legendary GRE Tunnel Manager  (v1.1.2)
+# Legendary GRE Tunnel Manager  (v1.1.3)
 # IRAN <-> FOREIGN GRE tunnel with REAL CLIENT IP preservation.
 #
 # Copyright (C) 2026 Legendary
@@ -36,7 +36,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 
 trap 'rc=$?; echo; echo "[!] ERROR (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -83,6 +83,25 @@ chmod 600 "$PF_DB"
 
 pause() { echo; read -rp "Press Enter to continue..." _ || true; }
 
+# Menu input, cleaned up before it is matched. A stray carriage return (some
+# SSH clients and pastes send CRLF) or a leading/trailing space makes an
+# otherwise valid "1" fall through to the invalid branch, which looks like the
+# menu ignoring a correct answer.
+read_choice() {
+    local prompt="$1" __var="$2" ans
+    if ! read -rp "$prompt" ans; then
+        echo
+        echo "No more input - exiting."
+        exit 0
+    fi
+    ans="${ans//$'\r'/}"
+    ans="${ans//$'\t'/}"
+    ans="${ans## }"; ans="${ans%% }"
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+    printf -v "$__var" '%s' "$ans"
+}
+
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 install_if_missing() {
@@ -99,10 +118,19 @@ install_if_missing() {
 }
 
 load_state() {
+    # Clear first. Sourcing only sets what the file contains, so without this
+    # the values from a previous load survive after the state file is deleted
+    # -- the menu then keeps advertising a tunnel that no longer exists, and
+    # functions that gate on "$SIDE" or "$TUN_NAME" act on a removed setup.
+    SIDE=""; TUN_NAME=""; LOCAL_IP=""; REMOTE_IP=""
+    TUN_LOCAL_IP=""; TUN_PEER_IP=""; TUN_LOCAL_CIDR=""
+    MTU=""; EXTRA_PUBLIC_IPS=""
+
     if [ -f "$STATE_FILE" ]; then
         # shellcheck disable=SC1090
         . "$STATE_FILE"
     fi
+    return 0
 }
 
 valid_ip() {
@@ -444,7 +472,7 @@ create_tunnel() {
     echo "================================================"
     echo "1) IRAN server    (clients connect here)"
     echo "2) FOREIGN server (traffic exits here)"
-    read -rp "Select server role [1/2]: " role
+    read_choice "Select server role [1/2]: " role
     case "$role" in
         1) SIDE="IRAN" ;;
         2) SIDE="FOREIGN" ;;
@@ -455,9 +483,9 @@ create_tunnel() {
     echo
     [ -n "$detected" ] && echo "Detected public IP of this server: $detected"
 
-    read -rp "Enter IRAN server public IP: " iran_ip
+    read_choice "Enter IRAN server public IP: " iran_ip
     valid_ip "$iran_ip" || { echo "Invalid IP."; return 0; }
-    read -rp "Enter FOREIGN server public IP: " foreign_ip
+    read_choice "Enter FOREIGN server public IP: " foreign_ip
     valid_ip "$foreign_ip" || { echo "Invalid IP."; return 0; }
 
     if [ "$SIDE" = "IRAN" ]; then
@@ -472,12 +500,12 @@ create_tunnel() {
         echo
         echo "[!] $LOCAL_IP is NOT configured on any interface of this server."
         [ -n "$detected" ] && echo "    This server appears to be $detected."
-        read -rp "Continue anyway? [y/N]: " yn
+        read_choice "Continue anyway? [y/N]: " yn
         [[ "${yn:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
     fi
 
     echo
-    read -rp "Tunnel subnet [$DEFAULT_TUN_NET]: " tun_net
+    read_choice "Tunnel subnet [$DEFAULT_TUN_NET]: " tun_net
     tun_net="${tun_net:-$DEFAULT_TUN_NET}"
     base="${tun_net%%/*}"
     valid_ip "$base" || { echo "Invalid subnet."; return 0; }
@@ -493,10 +521,10 @@ create_tunnel() {
         TUN_LOCAL_IP="$o1.$o2.$o3.1"; TUN_PEER_IP="$o1.$o2.$o3.2"
     fi
 
-    read -rp "Tunnel interface name [$DEFAULT_TUN_NAME]: " TUN_NAME
+    read_choice "Tunnel interface name [$DEFAULT_TUN_NAME]: " TUN_NAME
     TUN_NAME="${TUN_NAME:-$DEFAULT_TUN_NAME}"
 
-    read -rp "Tunnel MTU [$DEFAULT_MTU]: " mtu_in
+    read_choice "Tunnel MTU [$DEFAULT_MTU]: " mtu_in
     MTU="${mtu_in:-$DEFAULT_MTU}"
     [[ "$MTU" =~ ^[0-9]+$ ]] && [ "$MTU" -ge 576 ] && [ "$MTU" -le 9000 ] \
         || { echo "Invalid MTU."; return 0; }
@@ -507,7 +535,7 @@ create_tunnel() {
         echo "Port-forwards are published on every address of the default-route"
         echo "interface. Add extra addresses here only if this server has a routed"
         echo "IP that does not show up in 'ip addr' (space separated, or leave empty)."
-        read -rp "Extra public IPs []: " extra
+        read_choice "Extra public IPs []: " extra
         EXTRA_PUBLIC_IPS="$extra"
     fi
 
@@ -528,7 +556,7 @@ create_tunnel() {
         echo "    The kernel allows only one GRE tunnel per local/remote pair,"
         echo "    so this one cannot be created until that one is gone."
         echo
-        read -rp "Delete the conflicting tunnel now? [y/N]: " yn2
+        read_choice "Delete the conflicting tunnel now? [y/N]: " yn2
         if [[ "${yn2:-N}" =~ ^[Yy]$ ]]; then
             printf '%s\n' "$conflict" | awk -F: '{print $1}' | while read -r old; do
                 [ -n "$old" ] || continue
@@ -739,22 +767,22 @@ add_port_forward() {
 
     local lport tport proto_sel bindip ip_sel n
     echo
-    read -rp "Public port on the IRAN server: " lport
+    read_choice "Public port on the IRAN server: " lport
     valid_port "$lport" || { echo "Invalid port."; return 0; }
 
     if [ "$lport" = "22" ]; then
         echo "[!] Forwarding port 22 will send your SSH to the other server."
-        read -rp "    Really do that? [y/N]: " yn
+        read_choice "    Really do that? [y/N]: " yn
         [[ "${yn:-N}" =~ ^[Yy]$ ]] || return 0
     fi
 
-    read -rp "Destination port on the FOREIGN server [$lport]: " tport
+    read_choice "Destination port on the FOREIGN server [$lport]: " tport
     tport="${tport:-$lport}"
     valid_port "$tport" || { echo "Invalid port."; return 0; }
 
     echo
     echo "1) TCP    2) UDP    3) TCP + UDP"
-    read -rp "Protocol [1-3]: " proto_sel
+    read_choice "Protocol [1-3]: " proto_sel
 
     local -a protos=()
     case "$proto_sel" in
@@ -787,7 +815,7 @@ add_port_forward() {
             n=$((n + 1))
             echo "  $n) $a"
         done
-        read -rp "Publish this forward on [0-$n, default 0]: " ip_sel
+        read_choice "Publish this forward on [0-$n, default 0]: " ip_sel
         ip_sel="${ip_sel:-0}"
         if [ "$ip_sel" != "0" ]; then
             if [[ "$ip_sel" =~ ^[0-9]+$ ]] && [ "$ip_sel" -ge 1 ] && [ "$ip_sel" -le "$n" ]; then
@@ -830,7 +858,7 @@ delete_port_forward() {
 
     # Deleting by line number, not by port: the same port can now be published
     # on two different addresses, so a port alone is no longer unique.
-    read -rp "Entry number to remove [1-$total]: " sel
+    read_choice "Entry number to remove [1-$total]: " sel
     if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "$total" ]; then
         echo "Invalid entry number."
         return 0
@@ -865,14 +893,15 @@ port_forward_menu() {
         echo "4) Remove all"
         echo "0) Back"
         echo
-        read -rp "Select [0-4]: " sel
+        read_choice "Select [0-4]: " sel
         case "$sel" in
             1) add_port_forward || true; pause ;;
             2) list_port_forwards || true; pause ;;
             3) delete_port_forward || true; pause ;;
             4) remove_all_port_forwards || true; pause ;;
             0) return 0 ;;
-            *) echo "Invalid selection." ;;
+            "") echo "Nothing entered." ;;
+            *) printf 'Invalid selection: %q\n' "$sel" ;;
         esac
     done
 }
@@ -891,12 +920,12 @@ tools_menu() {
     echo "2) Auto MTU scan"
     echo "3) Start iperf3 server (run this on the peer first)"
     echo "4) Speed test to peer"
-    read -rp "Select [1-4]: " sel
+    read_choice "Select [1-4]: " sel
 
     case "$sel" in
         1)
             local m
-            read -rp "New MTU: " m
+            read_choice "New MTU: " m
             [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -ge 576 ] && [ "$m" -le 9000 ] \
                 || { echo "Invalid MTU."; return 0; }
             ip link set "$TUN_NAME" mtu "$m"
@@ -953,7 +982,7 @@ tools_menu() {
 
 remove_everything() {
     echo
-    read -rp "Remove the tunnel, all rules and the service? [y/N]: " yn
+    read_choice "Remove the tunnel, all rules and the service? [y/N]: " yn
     [[ "${yn:-N}" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
 
     load_state
@@ -1005,7 +1034,7 @@ main_menu() {
         echo "6) Remove everything"
         echo "0) Exit"
         echo
-        read -rp "Select [0-6]: " sel
+        read_choice "Select [0-6]: " sel
         case "$sel" in
             1) create_tunnel || true; pause ;;
             2) show_status || true; pause ;;
@@ -1014,7 +1043,8 @@ main_menu() {
             5) tools_menu || true; pause ;;
             6) remove_everything || true; pause ;;
             0) exit 0 ;;
-            *) echo "Invalid selection." ;;
+            "") echo "Nothing entered." ;;
+            *) printf 'Invalid selection: %q\n' "$sel" ;;
         esac
     done
 }
