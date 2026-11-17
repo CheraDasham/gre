@@ -30,6 +30,7 @@ client 1.2.3.4  ──►  IRAN server  ══ GRE ══►  FOREIGN server
 - **Exact, complete removal** — every rule carries a `LEGENDARY_GRE_` comment tag, so teardown removes what this script created and nothing else. Your Docker, WireGuard and SSH rules are untouched.
 - **Built-in diagnostics** — detects the three classic landmines above on an already-configured server and tells you how to remove them.
 - **Port forward manager** — add, list and remove forwards; saved to disk and restored on boot.
+- **Per-IP binding** — on a server with several public addresses, a forward can be published on exactly one of them, leaving the others free.
 - **MTU scan and iperf3 speed test** over the tunnel.
 
 ---
@@ -50,7 +51,7 @@ That last point is the single most common reason a tunnel comes up but passes no
 On **both** servers:
 
 ```bash
-wget https://raw.githubusercontent.com/CheraDasham/gre/refs/heads/main/legendary-gre.sh
+wget https://raw.githubusercontent.com/CheraDasham/gre/main/legendary-gre.sh
 sed -i 's/\r$//' legendary-gre.sh      # only needed if the file was touched on Windows
 chmod +x legendary-gre.sh
 sudo ./legendary-gre.sh
@@ -96,9 +97,29 @@ Then run option **`3) Diagnose`** on both sides. It checks the interface, endpoi
 
 On the **Iran** server, option **`4) Port forward manager`** → **`1) Add port forward`**.
 
-Give it the public port on Iran, the destination port on the foreign server, and the protocol (TCP / UDP / both). Forwards are published on every address of the default-route interface — Docker bridges, other tunnels and private ranges are excluded automatically.
+Give it the public port on Iran, the destination port on the foreign server, and the protocol (TCP / UDP / both).
 
-Mark a forward **persistent** and it is written to `/etc/legendary-gre/portforwards.db` and restored on every boot.
+**Choosing which address answers.** If the Iran server has more than one public IP, the script asks which one this forward should be published on:
+
+```
+This server has more than one public address.
+  0) all of them
+  1) 164.37.106.218
+  2) 164.37.106.219
+Publish this forward on [0-2, default 0]:
+```
+
+Pick `1` and only `164.37.106.218` gets a DNAT rule — `164.37.106.219` keeps that port free for whatever else is listening there. Pick `0` (the default, and what happens automatically on a single-IP server) and the forward is published on every address of the default-route interface. Docker bridges, other tunnels and private ranges are excluded either way.
+
+Because the same port can now be published on two different addresses, forwards are listed with a number and removed by that number rather than by port:
+
+```
+#    Proto    Public port    Target port    Bound to
+1    tcp      8080           8080           164.37.106.218
+2    tcp      443            443            all public IPs
+```
+
+Forwards are stored in `/etc/legendary-gre/portforwards.db` and re-applied on every boot.
 
 > Forwarding port `22` sends your own SSH to the other server. The script asks for confirmation before doing that.
 
@@ -162,6 +183,16 @@ Option **`6) Remove everything`** removes the tunnel, all tagged rules, the poli
 
 ## Troubleshooting
 
+**`add tunnel "gre0" failed: File exists`, then `Cannot find device`.**
+Another GRE tunnel already uses the same pair of endpoints. The kernel identifies a GRE tunnel by its `(local, remote)` addresses, **not** by its interface name, so only one tunnel can exist per endpoint pair — and the error confusingly names the kernel's `gre0` fallback device instead of the interface you asked for. List what exists and remove the conflicting one:
+
+```bash
+ip -d tunnel show | grep -i gre
+ip tunnel del <name>
+```
+
+`gre0` itself (`remote any local any`) is the harmless fallback device — leave it alone. If the old tunnel was created by another script with its own systemd unit, disable that unit too, or it will come back on the next boot. Option `1) Create / Reconfigure tunnel` detects this conflict up front and offers to clear it.
+
 **Tunnel is up but nothing passes.**
 GRE (protocol 47) is blocked somewhere. Confirm with `tcpdump` on both ends simultaneously:
 
@@ -180,6 +211,9 @@ nc -zv 10.10.10.1 22
 
 **Foreign server still sees the tunnel IP.**
 A `MASQUERADE` rule survived on the Iran side. Option `3) Diagnose` detects it and prints the exact removal command.
+
+**A port is forwarded on an address it should not be.**
+The forward was added with `0) all of them`. Remove that entry by its number and re-add it, picking the single address you want.
 
 **Service shows `active (exited)`.**
 That is correct for a `oneshot` unit — it means the work completed successfully.
@@ -207,9 +241,28 @@ sudo ./legendary-gre.sh
 3. گزینه‌ی `3` (Diagnose) رو روی هر دو بزن — خودش رول‌های قدیمی مشکل‌ساز رو پیدا می‌کنه و دستور حذفشون رو می‌ده.
 4. برای فوروارد پورت، گزینه‌ی `4` **فقط روی سرور ایران**.
 
+**اگه سرور ایران چند تا IP عمومی داره،** موقع اضافه کردن فوروارد ازت می‌پرسه روی کدوم IP اعمال بشه. مثلاً `1` رو بزنی فقط روی `164.37.106.218` رول ساخته می‌شه و `164.37.106.219` دست‌نخورده می‌مونه. `0` یعنی روی همه‌ی IPها. چون یه پورت می‌تونه روی دو تا IP جدا باشه، حذف فورواردها با **شماره‌ی ردیف** انجام می‌شه نه با شماره‌ی پورت.
+
 **نکته‌ی مهم:** پروتکل GRE شماره‌ی `47` باید روی فایروال/Security Group **هر دو سرور** باز باشه. این پورت نیست، پروتکل IP جداست — توی پنل‌های ابری معمولاً گزینه‌ی «Different protocol» با شماره‌ی `47`. رایج‌ترین دلیل اینکه تانل بالا میاد ولی ترافیک رد نمی‌شه همینه.
 
+**اگه خطای `add tunnel "gre0" failed: File exists` گرفتی:** یه تانل GRE دیگه با همون جفت IP از قبل وجود داره. کرنل تانل GRE رو با جفت (local, remote) می‌شناسه نه با اسم اینترفیس، پس فقط یکی می‌تونه وجود داشته باشه. با `ip -d tunnel show | grep -i gre` پیداش کن و `ip tunnel del <name>` بزن. خودِ `gre0` دستگاه fallback کرنله و بی‌ضرره، کاری باهاش نداشته باش.
+
 همه‌چیز بعد ریبوت خودکار برمی‌گرده؛ نیازی به `iptables-persistent` نیست.
+
+---
+
+## Changelog
+
+**v1.1**
+- Port forwards can be bound to a single public IP on a multi-IP server; `0) all of them` keeps the previous behaviour.
+- Forwards are listed with an index and removed by index, since a port is no longer unique on its own.
+- Tunnel creation is now verified. Previously, if `ip tunnel add` failed the script still reported "ready" and everything after it failed with `Cannot find device`.
+- Conflicting GRE tunnels on the same endpoint pair are detected before setup and can be removed from the prompt.
+- Bounded the `ip rule` cleanup loop so teardown cannot spin forever on a box where something else uses fwmark.
+- Existing three-field `portforwards.db` entries are read unchanged — no migration needed.
+
+**v1.0**
+- Initial release.
 
 ---
 
