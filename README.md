@@ -253,6 +253,9 @@ sudo ./legendary-gre.sh
 
 ## Changelog
 
+**v1.1.2**
+- Generated helper scripts in `/usr/local/sbin` are now version-stamped and refreshed automatically when `legendary-gre.sh` is newer. Upgrading the script used to leave the old helpers in place, so new features ran against old logic — a four-field port-forward record fed to a three-field parser produced `iptables: Garbage after port value`.
+
 **v1.1.1**
 - Fixed `public_ips: command not found` when adding a port forward. The helper existed only inside the generated up-script, so the menu never showed the address picker and every forward silently landed on all addresses.
 - Warn instead of silently defaulting to "all" when the address list cannot be read.
