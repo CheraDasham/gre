@@ -253,6 +253,11 @@ sudo ./legendary-gre.sh
 
 ## Changelog
 
+**v1.1.3**
+- `Remove everything` left the deleted tunnel's values in the menu header and in the variables other actions gate on. `load_state` now clears them when the state file is gone.
+- Every prompt now strips carriage returns and surrounding whitespace before matching. A terminal or paste that sends CRLF made a valid `1` or `y` fall through to the invalid branch, which looked like the menu ignoring a correct answer.
+- An invalid entry now prints what was actually received, and end-of-input exits cleanly instead of looping.
+
 **v1.1.2**
 - Generated helper scripts in `/usr/local/sbin` are now version-stamped and refreshed automatically when `legendary-gre.sh` is newer. Upgrading the script used to leave the old helpers in place, so new features ran against old logic — a four-field port-forward record fed to a three-field parser produced `iptables: Garbage after port value`.
 
