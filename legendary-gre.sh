@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Legendary GRE Tunnel Manager  (v1.0)
+# Legendary GRE Tunnel Manager  (v1.1)
 # IRAN <-> FOREIGN GRE tunnel with REAL CLIENT IP preservation.
 #
 # Copyright (C) 2026 Legendary
@@ -36,7 +36,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.0"
+VERSION="1.1"
 
 trap 'rc=$?; echo; echo "[!] ERROR (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -281,9 +281,21 @@ fi
 # ------------------------------------------------- IRAN: port forwarding ----
 if [ "${SIDE:-}" = "IRAN" ]; then
     if [ -s "$PF_DB" ]; then
-        while IFS='|' read -r proto lport tport; do
+        # Record format: proto|public_port|target_port|bind_ip
+        # bind_ip empty  -> publish on every public address of this server
+        # bind_ip set    -> publish ONLY on that address
+        # Entries written by older versions have three fields; bind_ip then
+        # reads as empty, which is the old "all addresses" behaviour.
+        while IFS='|' read -r proto lport tport bindip; do
             [ -n "${proto:-}" ] || continue
-            marker="${PF_TAG}:${proto}:${lport}:${tport}"
+            bindip="${bindip:-}"
+            marker="${PF_TAG}:${proto}:${lport}:${tport}:${bindip:-all}"
+
+            if [ -n "$bindip" ]; then
+                ip_list="$bindip"
+            else
+                ip_list="$(public_ips)"
+            fi
 
             while IFS= read -r pubip; do
                 [ -n "$pubip" ] || continue
@@ -292,7 +304,7 @@ if [ "${SIDE:-}" = "IRAN" ]; then
                 ipt nat PREROUTING -d "$pubip" -p "$proto" --dport "$lport" \
                     -m comment --comment "$marker" \
                     -j DNAT --to-destination "${TUN_PEER_IP}:${tport}"
-            done < <(public_ips)
+            done <<< "$ip_list"
 
             ipt filter FORWARD -o "$TUN_NAME" -p "$proto" -d "$TUN_PEER_IP" --dport "$tport" \
                 -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
@@ -660,10 +672,13 @@ list_port_forwards() {
     echo
     echo "================ Saved port forwards =============="
     if [ -s "$PF_DB" ]; then
-        printf "%-8s %-14s %-14s\n" "Proto" "Public port" "Target port"
-        while IFS='|' read -r proto lport tport; do
+        printf "%-4s %-8s %-14s %-14s %s\n" "#" "Proto" "Public port" "Target port" "Bound to"
+        local i=0
+        while IFS='|' read -r proto lport tport bindip; do
             [ -n "${proto:-}" ] || continue
-            printf "%-8s %-14s %-14s\n" "$proto" "$lport" "$tport"
+            i=$((i + 1))
+            printf "%-4s %-8s %-14s %-14s %s\n" \
+                "$i" "$proto" "$lport" "$tport" "${bindip:-all public IPs}"
         done < "$PF_DB"
     else
         echo "None."
@@ -685,7 +700,7 @@ add_port_forward() {
         return 0
     fi
 
-    local lport tport proto_sel
+    local lport tport proto_sel bindip ip_sel n
     echo
     read -rp "Public port on the IRAN server: " lport
     valid_port "$lport" || { echo "Invalid port."; return 0; }
@@ -712,15 +727,50 @@ add_port_forward() {
         *) echo "Invalid selection."; return 0 ;;
     esac
 
+    # Which address should answer on this port. With several addresses on the
+    # server you usually want the forward on exactly one of them, so the others
+    # stay free for whatever else is listening there.
+    local -a ips=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && ips+=("$line")
+    done < <(public_ips)
+
+    bindip=""
+    if [ "${#ips[@]}" -gt 1 ]; then
+        echo
+        echo "This server has more than one public address."
+        echo "  0) all of them"
+        n=0
+        for a in "${ips[@]}"; do
+            n=$((n + 1))
+            echo "  $n) $a"
+        done
+        read -rp "Publish this forward on [0-$n, default 0]: " ip_sel
+        ip_sel="${ip_sel:-0}"
+        if [ "$ip_sel" != "0" ]; then
+            if [[ "$ip_sel" =~ ^[0-9]+$ ]] && [ "$ip_sel" -ge 1 ] && [ "$ip_sel" -le "$n" ]; then
+                bindip="${ips[$((ip_sel - 1))]}"
+            else
+                echo "Invalid selection."
+                return 0
+            fi
+        fi
+    fi
+
     local p
     for p in "${protos[@]}"; do
-        grep -Fxq "${p}|${lport}|${tport}" "$PF_DB" \
-            || echo "${p}|${lport}|${tport}" >> "$PF_DB"
+        grep -Fxq "${p}|${lport}|${tport}|${bindip}" "$PF_DB" \
+            || echo "${p}|${lport}|${tport}|${bindip}" >> "$PF_DB"
     done
 
     "$UP_SCRIPT" >/dev/null
     echo
     echo "[+] Forwarding ${protos[*]} ${lport} -> ${TUN_PEER_IP}:${tport}"
+    if [ -n "$bindip" ]; then
+        echo "[i] Published on $bindip only. Other addresses of this server are untouched."
+    else
+        echo "[i] Published on every public address of this server."
+    fi
     echo "[i] No SNAT is applied, so the foreign server sees the real client IP."
     echo "[i] Make sure the FOREIGN server is listening on port ${tport}."
 }
@@ -729,19 +779,30 @@ delete_port_forward() {
     load_state
     list_port_forwards
     echo
-    local lport tmp
-    read -rp "Public port to remove: " lport
-    valid_port "$lport" || { echo "Invalid port."; return 0; }
+    local sel tmp total
+    total="$(grep -c . "$PF_DB" 2>/dev/null || echo 0)"
+    if [ "$total" -eq 0 ]; then
+        echo "Nothing to remove."
+        return 0
+    fi
+
+    # Deleting by line number, not by port: the same port can now be published
+    # on two different addresses, so a port alone is no longer unique.
+    read -rp "Entry number to remove [1-$total]: " sel
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "$total" ]; then
+        echo "Invalid entry number."
+        return 0
+    fi
 
     tmp="$(mktemp)"
-    awk -F'|' -v p="$lport" '$2 != p' "$PF_DB" > "$tmp"
+    awk -v n="$sel" 'NF { c++ } c != n || !NF' "$PF_DB" > "$tmp"
     mv "$tmp" "$PF_DB"
     chmod 600 "$PF_DB"
 
     # Drop every managed forward rule, then re-apply what remains.
     remove_tagged_rules "$PF_TAG"
     "$UP_SCRIPT" >/dev/null
-    echo "[+] Removed port $lport."
+    echo "[+] Removed entry $sel."
 }
 
 remove_all_port_forwards() {
