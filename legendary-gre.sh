@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Legendary GRE Tunnel Manager  (v1.2.0)
+# Legendary GRE Tunnel Manager  (v1.2.1)
 # IRAN <-> FOREIGN GRE tunnels with REAL CLIENT IP preservation.
 #
 # Copyright (C) 2026 Legendary
@@ -40,7 +40,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 trap 'rc=$?; echo; echo "[!] ERROR (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -188,6 +188,25 @@ remove_tagged_rules() {
     return 0
 }
 
+# Delete every "ip rule" pointing at a routing table, whatever mark spec it
+# carries. The spec has to be read back rather than assumed: the mask widens
+# when a tunnel is added and narrows when one is removed, and "ip rule del"
+# only matches a rule when the mark AND the mask are given exactly as stored.
+del_rules_for_table() {
+    local tbl="$1" line spec
+    for _ in 1 2 3 4 5 6 7 8; do
+        line="$(ip rule show 2>/dev/null | grep -E "lookup $tbl( |\$)" | head -1 || true)"
+        [ -n "$line" ] || break
+        spec="$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')"
+        if [ -n "$spec" ]; then
+            ip rule del fwmark "$spec" lookup "$tbl" 2>/dev/null || break
+        else
+            ip rule del lookup "$tbl" 2>/dev/null || break
+        fi
+    done
+    return 0
+}
+
 # ------------------------------------------------------------ tunnel state --
 
 tunnel_names() {
@@ -321,6 +340,25 @@ ipt() {
 
 set_proc() { [ -w "$1" ] && echo "$2" > "$1"; return 0; }
 
+# Delete every "ip rule" pointing at a routing table, whatever mark spec it
+# carries. The spec has to be read back rather than assumed: the mask widens
+# when a tunnel is added and narrows when one is removed, and "ip rule del"
+# only matches a rule when the mark AND the mask are given exactly as stored.
+del_rules_for_table() {
+    local tbl="$1" line spec
+    for _ in 1 2 3 4 5 6 7 8; do
+        line="$(ip rule show 2>/dev/null | grep -E "lookup $tbl( |\$)" | head -1 || true)"
+        [ -n "$line" ] || break
+        spec="$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')"
+        if [ -n "$spec" ]; then
+            ip rule del fwmark "$spec" lookup "$tbl" 2>/dev/null || break
+        else
+            ip rule del lookup "$tbl" 2>/dev/null || break
+        fi
+    done
+    return 0
+}
+
 public_ips() {
     local wan
     wan="$(ip route show default 2>/dev/null | \
@@ -424,8 +462,9 @@ for CONF in "${CONFS[@]}"; do
         ipt mangle PREROUTING -i "$TUN_NAME" -m conntrack --ctstate NEW \
             -m comment --comment "$TAG" -j CONNMARK --set-mark "$MARK_HEX/$MASK_HEX"
 
-        ip rule show 2>/dev/null | grep -q "fwmark $MARK_HEX.*lookup $RT_TABLE" \
-            || ip rule add fwmark "$MARK_HEX/$MASK_HEX" lookup "$RT_TABLE"
+        ip rule show 2>/dev/null | grep -q "fwmark $MARK_HEX/$MASK_HEX lookup $RT_TABLE" \
+            || { del_rules_for_table "$RT_TABLE"
+                 ip rule add fwmark "$MARK_HEX/$MASK_HEX" lookup "$RT_TABLE"; }
         ip route replace default via "$TUN_PEER_IP" dev "$TUN_NAME" table "$RT_TABLE"
 
         log "$TUN_NAME (FOREIGN <- $REMOTE_IP): up, mark $MARK_HEX/$MASK_HEX, table $RT_TABLE"
@@ -528,14 +567,19 @@ for CONF in "$TUN_DIR"/*.conf; do
     . "$CONF"
     [ -n "$TUN_NAME" ] || continue
 
-    if [ -n "$MARK" ] && [ -n "$RT_TABLE" ]; then
-        MARK_HEX="$(printf '0x%x' "$MARK")"
-        # Bounded on purpose. An unbounded "while grep; do del; done" spins
-        # forever if the delete ever reports success without removing what the
-        # grep matched.
+    if [ -n "$RT_TABLE" ]; then
+        # Read the mark spec back rather than rebuilding it: "ip rule del"
+        # only matches when the mark and its mask are given exactly as stored,
+        # and the mask depends on how many tunnels existed at the time.
         for _ in 1 2 3 4 5 6 7 8; do
-            ip rule show 2>/dev/null | grep -q "fwmark $MARK_HEX.*lookup $RT_TABLE" || break
-            ip rule del fwmark "$MARK_HEX" lookup "$RT_TABLE" 2>/dev/null || break
+            line="$(ip rule show 2>/dev/null | grep -E "lookup $RT_TABLE( |\$)" | head -1 || true)"
+            [ -n "$line" ] || break
+            spec="$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')"
+            if [ -n "$spec" ]; then
+                ip rule del fwmark "$spec" lookup "$RT_TABLE" 2>/dev/null || break
+            else
+                ip rule del lookup "$RT_TABLE" 2>/dev/null || break
+            fi
         done
         ip route flush table "$RT_TABLE" 2>/dev/null || true
     fi
@@ -610,7 +654,7 @@ migrate_legacy_state() {
 
 create_tunnel() {
     local detected role iran_ip foreign_ip idx mtu_in extra existing reuse
-    local conflict yn2
+    local conflict yn2 target
 
     echo
     echo "================================================"
@@ -618,7 +662,14 @@ create_tunnel() {
     echo "================================================"
 
     # Reconfigure an existing one, or set up a new one.
-    TUN_NAME=""
+    #
+    # The chosen tunnel is tracked in its own variable, never in TUN_NAME:
+    # listing the tunnels below calls load_tunnel, which overwrites TUN_NAME
+    # with whatever it read last. Deciding "new or existing?" from TUN_NAME
+    # would therefore always see the last listed tunnel and silently
+    # reconfigure it instead of adding a new one.
+    target=""
+    idx=""
     if [ "$(tunnel_count)" -gt 0 ]; then
         echo "Configured tunnels:"
         while IFS= read -r t; do
@@ -629,19 +680,28 @@ create_tunnel() {
         read_choice "Reconfigure one of these instead of adding a new tunnel? [y/N]: " reuse
         if [[ "${reuse:-N}" =~ ^[Yy]$ ]]; then
             pick_tunnel existing "Tunnel to reconfigure" || return 0
-            TUN_NAME="$existing"
-            load_tunnel "$TUN_NAME"
-            idx="${TUN_NAME#legend}"
+            target="$existing"
+            idx="${target#legend}"
         fi
     fi
 
-    if [ -z "$TUN_NAME" ]; then
+    if [ -z "$target" ]; then
         if ! idx="$(next_free_index)"; then
             echo "All $MAX_TUNNELS tunnel slots are in use. Remove one first."
             return 0
         fi
-        TUN_NAME="legend$idx"
+        target="legend$idx"
+        echo
+        echo "[i] Adding a new tunnel in slot $idx: $target"
     fi
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+        echo "[!] Could not work out a slot index for '$target'."
+        return 0
+    fi
+
+    clear_tunnel_vars
+    TUN_NAME="$target"
 
     echo
     echo "1) IRAN server    (clients connect here)"
@@ -1178,12 +1238,7 @@ remove_one_tunnel() {
     remove_tagged_rules "${PF_TAG}:${tun}:"
 
     if [ -n "${MARK:-}" ] && [ -n "${RT_TABLE:-}" ]; then
-        local mh
-        mh="$(printf '0x%x' "$MARK")"
-        for _ in 1 2 3 4 5 6 7 8; do
-            ip rule show 2>/dev/null | grep -q "fwmark $mh.*lookup $RT_TABLE" || break
-            ip rule del fwmark "$mh" lookup "$RT_TABLE" 2>/dev/null || break
-        done
+        del_rules_for_table "$RT_TABLE"
         ip route flush table "$RT_TABLE" 2>/dev/null || true
     fi
 
@@ -1227,12 +1282,7 @@ remove_everything() {
         [ -n "$t" ] || continue
         load_tunnel "$t" || continue
         if [ -n "${MARK:-}" ] && [ -n "${RT_TABLE:-}" ]; then
-            local mh
-            mh="$(printf '0x%x' "$MARK")"
-            for _ in 1 2 3 4 5 6 7 8; do
-                ip rule show 2>/dev/null | grep -q "fwmark $mh.*lookup $RT_TABLE" || break
-                ip rule del fwmark "$mh" lookup "$RT_TABLE" 2>/dev/null || break
-            done
+            del_rules_for_table "$RT_TABLE"
             ip route flush table "$RT_TABLE" 2>/dev/null || true
         fi
         ip tunnel del "$t" 2>/dev/null || ip link del "$t" 2>/dev/null || true
