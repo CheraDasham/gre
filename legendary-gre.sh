@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Legendary GRE Tunnel Manager  (v1.1.3)
-# IRAN <-> FOREIGN GRE tunnel with REAL CLIENT IP preservation.
+# Legendary GRE Tunnel Manager  (v1.2.0)
+# IRAN <-> FOREIGN GRE tunnels with REAL CLIENT IP preservation.
 #
 # Copyright (C) 2026 Legendary
 #
@@ -19,24 +19,28 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 # Design notes:
+#   * Several tunnels per server. One foreign server can terminate tunnels
+#     from many Iran servers at once, each with its own interface, subnet,
+#     firewall mark and routing table, so return traffic for one tunnel can
+#     never be sent out another.
 #   * No catch-all DNAT. A blanket PREROUTING DNAT sends EVERY inbound packet
 #     to the peer, which cuts SSH the moment the far side is not ready.
-#     which cut SSH the moment the far side was not ready.
-#   * No catch-all MASQUERADE. That rule is exactly why ip_limit on the
-#     foreign side only ever saw the tunnel IP: it rewrote every client's
-#     source address. Here the IRAN side does DNAT only, and the FOREIGN side
-#     marks tunnel-originated connections (CONNMARK) and sends their replies
-#     back through the tunnel via a policy route, so the real client IP
+#   * No catch-all MASQUERADE. That rule is why ip_limit on the foreign side
+#     only ever sees the tunnel IP: it rewrites every client's source address.
+#     Here the Iran side does DNAT only, and the foreign side marks
+#     tunnel-originated connections (CONNMARK) and sends their replies back
+#     through the right tunnel via a policy route, so the real client IP
 #     survives end to end.
-#   * No blanket "DROP icmp". It broke ping through the tunnel for no gain.
-#   * Everything is re-applied from one state file by one systemd unit, so a
-#     reboot restores the tunnel, sysctls, routing and port-forwards together.
-#     No dependency on iptables-persistent.
-#   * Every rule carries a comment tag, so removal is exact and complete.
+#   * No blanket "DROP icmp". It breaks ping through the tunnel for no gain.
+#   * Everything is re-applied from the per-tunnel state files by one systemd
+#     unit, so a reboot restores every tunnel, its sysctls, routing and
+#     port-forwards together. No dependency on iptables-persistent.
+#   * Every rule carries a comment tag naming its tunnel, so removing one
+#     tunnel cannot disturb another.
 #
 set -Eeuo pipefail
 
-VERSION="1.1.3"
+VERSION="1.2.0"
 
 trap 'rc=$?; echo; echo "[!] ERROR (exit $rc) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -52,8 +56,9 @@ if [ ! -t 0 ]; then
 fi
 
 BASE_DIR="/etc/legendary-gre"
-STATE_FILE="$BASE_DIR/state"
+TUN_DIR="$BASE_DIR/tunnels"
 PF_DB="$BASE_DIR/portforwards.db"
+LEGACY_STATE="$BASE_DIR/state"
 
 UP_SCRIPT="/usr/local/sbin/legendary-gre-up.sh"
 DOWN_SCRIPT="/usr/local/sbin/legendary-gre-down.sh"
@@ -70,18 +75,22 @@ PF_TAG="${TAG_PREFIX}PF"
 # running the old logic -- and the symptoms show up far from the cause.
 HELPER_STAMP="# LEGENDARY_GRE_HELPER_VERSION=$VERSION"
 
-DEFAULT_TUN_NAME="legend0"
-DEFAULT_TUN_NET="10.10.10.0/30"
+MAX_TUNNELS=8
 DEFAULT_MTU="1476"
 
-mkdir -p "$BASE_DIR"
-chmod 700 "$BASE_DIR"
+IP_BIN="$(command -v ip || echo /sbin/ip)"
+IPT_BIN="$(command -v iptables || echo /usr/sbin/iptables)"
+
+mkdir -p "$TUN_DIR"
+chmod 700 "$BASE_DIR" "$TUN_DIR"
 touch "$PF_DB"
 chmod 600 "$PF_DB"
 
 # ---------------------------------------------------------------- helpers ---
 
 pause() { echo; read -rp "Press Enter to continue..." _ || true; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # Menu input, cleaned up before it is matched. A stray carriage return (some
 # SSH clients and pastes send CRLF) or a leading/trailing space makes an
@@ -96,13 +105,10 @@ read_choice() {
     fi
     ans="${ans//$'\r'/}"
     ans="${ans//$'\t'/}"
-    ans="${ans## }"; ans="${ans%% }"
     ans="${ans#"${ans%%[![:space:]]*}"}"
     ans="${ans%"${ans##*[![:space:]]}"}"
     printf -v "$__var" '%s' "$ans"
 }
-
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 install_if_missing() {
     local pkg="$1" cmd="$2"
@@ -113,22 +119,6 @@ install_if_missing() {
     if ! apt-get install -y "$pkg" >/dev/null; then
         echo "[!] Could not install $pkg. Install it manually and retry."
         return 1
-    fi
-    return 0
-}
-
-load_state() {
-    # Clear first. Sourcing only sets what the file contains, so without this
-    # the values from a previous load survive after the state file is deleted
-    # -- the menu then keeps advertising a tunnel that no longer exists, and
-    # functions that gate on "$SIDE" or "$TUN_NAME" act on a removed setup.
-    SIDE=""; TUN_NAME=""; LOCAL_IP=""; REMOTE_IP=""
-    TUN_LOCAL_IP=""; TUN_PEER_IP=""; TUN_LOCAL_CIDR=""
-    MTU=""; EXTRA_PUBLIC_IPS=""
-
-    if [ -f "$STATE_FILE" ]; then
-        # shellcheck disable=SC1090
-        . "$STATE_FILE"
     fi
     return 0
 }
@@ -159,10 +149,6 @@ ip_is_local() {
 # The public entry-point addresses of this server: the addresses on whichever
 # interface carries the default route, plus anything in EXTRA_PUBLIC_IPS. That
 # excludes docker bridges, other tunnels and private ranges by construction.
-#
-# This has to exist here as well as inside the generated up-script. The two
-# must agree, because this one builds the list the operator picks from and
-# that one builds the rules from the picked value.
 public_ips() {
     local wan
     wan="$(ip route show default 2>/dev/null | \
@@ -179,10 +165,8 @@ public_ips() {
     return 0
 }
 
-# Remove every iptables rule whose comment starts with the given tag.
-# Parsed per table so the -D lands in the right table, and eval'd so the
-# quoting around the comment value survives (an unquoted expansion here
-# passes the quote characters through literally and matches nothing).
+# Remove every iptables rule whose comment starts with the given tag. Pass a
+# tunnel-scoped tag to touch only that tunnel's rules.
 remove_tagged_rules() {
     local tag="$1" table rules
     for table in filter nat mangle raw; do
@@ -204,6 +188,100 @@ remove_tagged_rules() {
     return 0
 }
 
+# ------------------------------------------------------------ tunnel state --
+
+tunnel_names() {
+    local f
+    for f in "$TUN_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        basename "$f" .conf
+    done
+}
+
+tunnel_count() { tunnel_names | grep -c . || true; }
+
+clear_tunnel_vars() {
+    SIDE=""; TUN_NAME=""; LOCAL_IP=""; REMOTE_IP=""
+    TUN_LOCAL_IP=""; TUN_PEER_IP=""; TUN_LOCAL_CIDR=""
+    MTU=""; MARK=""; RT_TABLE=""; EXTRA_PUBLIC_IPS=""
+}
+
+load_tunnel() {
+    # Clear first: sourcing only sets what the file contains, so without this
+    # the previous tunnel's values survive and the caller silently acts on the
+    # wrong one.
+    clear_tunnel_vars
+    [ -f "$TUN_DIR/$1.conf" ] || return 1
+    # shellcheck disable=SC1090
+    . "$TUN_DIR/$1.conf"
+    return 0
+}
+
+save_tunnel() {
+    cat > "$TUN_DIR/$TUN_NAME.conf" <<EOF
+SIDE="$SIDE"
+TUN_NAME="$TUN_NAME"
+LOCAL_IP="$LOCAL_IP"
+REMOTE_IP="$REMOTE_IP"
+TUN_LOCAL_IP="$TUN_LOCAL_IP"
+TUN_PEER_IP="$TUN_PEER_IP"
+TUN_LOCAL_CIDR="$TUN_LOCAL_IP/30"
+MTU="$MTU"
+MARK="$MARK"
+RT_TABLE="$RT_TABLE"
+EXTRA_PUBLIC_IPS="${EXTRA_PUBLIC_IPS:-}"
+EOF
+    chmod 600 "$TUN_DIR/$TUN_NAME.conf"
+}
+
+# Lowest index not already taken. Index N gives interface legend<N>, subnet
+# 10.10.(10+N).0/30, mark N+1 and routing table 100+N, so every tunnel is
+# isolated from every other without the operator having to think about it.
+next_free_index() {
+    local i used
+    for (( i=0; i<MAX_TUNNELS; i++ )); do
+        used=0
+        [ -e "$TUN_DIR/legend$i.conf" ] && used=1
+        [ "$used" -eq 0 ] && { echo "$i"; return 0; }
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- picking ---
+
+# Ask which tunnel to act on. With exactly one configured, use it silently.
+pick_tunnel() {
+    local __var="$1" prompt="${2:-Select tunnel}" n=0 sel
+    local -a names=()
+    while IFS= read -r t; do [ -n "$t" ] && names+=("$t"); done < <(tunnel_names)
+
+    if [ "${#names[@]}" -eq 0 ]; then
+        echo "No tunnels are configured yet."
+        return 1
+    fi
+    if [ "${#names[@]}" -eq 1 ]; then
+        printf -v "$__var" '%s' "${names[0]}"
+        return 0
+    fi
+
+    echo
+    for t in "${names[@]}"; do
+        n=$((n + 1))
+        if load_tunnel "$t"; then
+            printf "  %s) %-10s %-8s %s -> %s\n" "$n" "$t" "$SIDE" "$TUN_LOCAL_IP" "$REMOTE_IP"
+        else
+            printf "  %s) %s\n" "$n" "$t"
+        fi
+    done
+    read_choice "$prompt [1-$n]: " sel
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "$n" ]; then
+        echo "Invalid selection."
+        return 1
+    fi
+    printf -v "$__var" '%s' "${names[$((sel - 1))]}"
+    return 0
+}
+
 # ------------------------------------------------------------- up script ---
 
 write_up_script() {
@@ -220,18 +298,19 @@ UPSTAMP
 set -uo pipefail
 
 BASE_DIR="/etc/legendary-gre"
-STATE_FILE="$BASE_DIR/state"
+TUN_DIR="$BASE_DIR/tunnels"
 PF_DB="$BASE_DIR/portforwards.db"
 SYS_TAG="LEGENDARY_GRE_SYS"
 PF_TAG="LEGENDARY_GRE_PF"
-MARK="0x1"
-RT_TABLE="100"
-
-[ -f "$STATE_FILE" ] || { echo "[legendary-gre] no state file, nothing to do"; exit 0; }
-# shellcheck disable=SC1090
-. "$STATE_FILE"
 
 log() { echo "[legendary-gre] $*"; }
+
+shopt -s nullglob
+CONFS=("$TUN_DIR"/*.conf)
+if [ "${#CONFS[@]}" -eq 0 ]; then
+    log "no tunnels configured, nothing to do"
+    exit 0
+fi
 
 # idempotent append:  ipt <table> <chain> <rule...>
 ipt() {
@@ -242,9 +321,6 @@ ipt() {
 
 set_proc() { [ -w "$1" ] && echo "$2" > "$1"; return 0; }
 
-# Public entry-point addresses of this box = addresses on the default-route
-# interface. Never docker0, never another tunnel, never a private range that
-# clients cannot reach.
 public_ips() {
     local wan
     wan="$(ip route show default 2>/dev/null | \
@@ -261,122 +337,162 @@ public_ips() {
     return 0
 }
 
+# The mark mask is the smallest all-ones value that can still tell every
+# configured tunnel apart. Keeping it as narrow as the tunnel count allows
+# means the CONNMARK rules leave the high bits -- where WireGuard and friends
+# keep their own marks -- completely untouched.
+MAX_MARK=1
+for c in "${CONFS[@]}"; do
+    m="$(awk -F'"' '/^MARK=/ {print $2}' "$c" 2>/dev/null)"
+    [ -n "$m" ] && [ "$m" -gt "$MAX_MARK" ] && MAX_MARK="$m"
+done
+MARK_MASK=1
+while [ "$MARK_MASK" -lt "$MAX_MARK" ]; do MARK_MASK=$(( (MARK_MASK << 1) | 1 )); done
+MASK_HEX="$(printf '0x%x' "$MARK_MASK")"
+
 modprobe ip_gre 2>/dev/null || true
 
-# ------------------------------------------------------------------ tunnel --
-if ip link show "$TUN_NAME" >/dev/null 2>&1; then
-    # change in place so the interface (and anything using it) is not torn down
-    ip tunnel change "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>/dev/null || {
-        ip tunnel del "$TUN_NAME" 2>/dev/null
-        ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
-    }
-else
-    ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
-fi
-
-# The kernel keys GRE tunnels on (local, remote, key) -- NOT on the interface
-# name. If another GRE tunnel already uses this exact pair of endpoints, the
-# add fails with EEXIST and, confusingly, reports the fallback device "gre0"
-# rather than the name that was asked for. Everything after that would fail
-# with "Cannot find device", so stop here instead of claiming success.
-if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
-    echo "[legendary-gre] ERROR: interface $TUN_NAME was not created." >&2
-    echo >&2
-    echo "  Most likely another GRE tunnel already uses the same endpoints" >&2
-    echo "  ($LOCAL_IP -> $REMOTE_IP). The kernel allows only one GRE tunnel" >&2
-    echo "  per local/remote pair, whatever the interface is called." >&2
-    echo >&2
-    echo "  Existing GRE tunnels on this server:" >&2
-    ip -d tunnel show 2>/dev/null | grep -i 'gre' | sed 's/^/    /' >&2 || true
-    echo >&2
-    echo "  Delete the conflicting one, then run this again:" >&2
-    echo "    ip tunnel del <name>" >&2
-    exit 1
-fi
-
-ip link set "$TUN_NAME" mtu "$MTU" 2>/dev/null || true
-ip link set "$TUN_NAME" txqueuelen 2000 2>/dev/null || true
-ip link set "$TUN_NAME" up
-ip addr replace "$TUN_LOCAL_CIDR" dev "$TUN_NAME"
-
-# ------------------------------------------------------------------ sysctl --
 sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
 # Loose reverse-path (2), not 0: still filters spoofing, but does not drop the
-# real client source addresses arriving on the tunnel.
+# real client source addresses arriving on a tunnel.
 set_proc /proc/sys/net/ipv4/conf/all/rp_filter 2
 set_proc /proc/sys/net/ipv4/conf/default/rp_filter 2
-set_proc "/proc/sys/net/ipv4/conf/$TUN_NAME/rp_filter" 2
 WAN_IF="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 [ -n "$WAN_IF" ] && set_proc "/proc/sys/net/ipv4/conf/$WAN_IF/rp_filter" 2
 
-# ------------------------------------------------------------- base rules --
-# GRE (IP protocol 47) from the peer only.
-ipt filter INPUT -p gre -s "$REMOTE_IP" -m comment --comment "$SYS_TAG" -j ACCEPT
+ANY_FOREIGN=0
 
-# Clamp MSS so forwarded TCP fits the tunnel MTU without fragmenting.
-ipt mangle FORWARD -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN \
-    -m comment --comment "$SYS_TAG" -j TCPMSS --clamp-mss-to-pmtu
-ipt mangle FORWARD -i "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN \
-    -m comment --comment "$SYS_TAG" -j TCPMSS --clamp-mss-to-pmtu
+for CONF in "${CONFS[@]}"; do
 
-# ------------------------------------------------- FOREIGN: return routing --
-if [ "${SIDE:-}" = "FOREIGN" ]; then
-    # Traffic arrives over the tunnel carrying the REAL client source IP.
-    # Without this, replies would leave via the default route straight to the
-    # client and be dropped as unsolicited. Mark the connection on arrival,
-    # restore the mark on the reply, and policy-route it back into the tunnel.
-    # Masked marks (0x1/0x1) leave other users of fwmark (WireGuard) alone.
-    ipt mangle PREROUTING -i "$TUN_NAME" -m conntrack --ctstate NEW \
-        -m comment --comment "$SYS_TAG" -j CONNMARK --set-mark "$MARK/$MARK"
-    ipt mangle PREROUTING -m comment --comment "$SYS_TAG" \
-        -j CONNMARK --restore-mark --nfmask "$MARK" --ctmask "$MARK"
-    ipt mangle OUTPUT -m comment --comment "$SYS_TAG" \
-        -j CONNMARK --restore-mark --nfmask "$MARK" --ctmask "$MARK"
+    SIDE=""; TUN_NAME=""; LOCAL_IP=""; REMOTE_IP=""
+    TUN_LOCAL_IP=""; TUN_PEER_IP=""; TUN_LOCAL_CIDR=""
+    MTU=""; MARK=""; RT_TABLE=""; EXTRA_PUBLIC_IPS=""
+    # shellcheck disable=SC1090
+    . "$CONF"
+    [ -n "$TUN_NAME" ] || continue
 
-    ip rule show 2>/dev/null | grep -q "fwmark $MARK.*lookup $RT_TABLE" \
-        || ip rule add fwmark "$MARK/$MARK" lookup "$RT_TABLE"
-    ip route replace default via "$TUN_PEER_IP" dev "$TUN_NAME" table "$RT_TABLE"
+    TAG="${SYS_TAG}:${TUN_NAME}"
 
-    log "FOREIGN side ready: $TUN_NAME up, return routing via table $RT_TABLE"
-fi
-
-# ------------------------------------------------- IRAN: port forwarding ----
-if [ "${SIDE:-}" = "IRAN" ]; then
-    if [ -s "$PF_DB" ]; then
-        # Record format: proto|public_port|target_port|bind_ip
-        # bind_ip empty  -> publish on every public address of this server
-        # bind_ip set    -> publish ONLY on that address
-        # Entries written by older versions have three fields; bind_ip then
-        # reads as empty, which is the old "all addresses" behaviour.
-        while IFS='|' read -r proto lport tport bindip; do
-            [ -n "${proto:-}" ] || continue
-            bindip="${bindip:-}"
-            marker="${PF_TAG}:${proto}:${lport}:${tport}:${bindip:-all}"
-
-            if [ -n "$bindip" ]; then
-                ip_list="$bindip"
-            else
-                ip_list="$(public_ips)"
-            fi
-
-            while IFS= read -r pubip; do
-                [ -n "$pubip" ] || continue
-                # DNAT only. No SNAT/MASQUERADE here -- that is what keeps the
-                # client's real source address intact for the foreign server.
-                ipt nat PREROUTING -d "$pubip" -p "$proto" --dport "$lport" \
-                    -m comment --comment "$marker" \
-                    -j DNAT --to-destination "${TUN_PEER_IP}:${tport}"
-            done <<< "$ip_list"
-
-            ipt filter FORWARD -o "$TUN_NAME" -p "$proto" -d "$TUN_PEER_IP" --dport "$tport" \
-                -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
-                -m comment --comment "$marker" -j ACCEPT
-            ipt filter FORWARD -i "$TUN_NAME" -p "$proto" -s "$TUN_PEER_IP" \
-                -m conntrack --ctstate ESTABLISHED,RELATED \
-                -m comment --comment "$marker" -j ACCEPT
-        done < "$PF_DB"
+    # ------------------------------------------------------------ tunnel --
+    if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        # change in place so the interface (and anything using it) is not torn down
+        ip tunnel change "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 2>/dev/null || {
+            ip tunnel del "$TUN_NAME" 2>/dev/null
+            ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
+        }
+    else
+        ip tunnel add "$TUN_NAME" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255
     fi
-    log "IRAN side ready: $TUN_NAME up, $(wc -l < "$PF_DB") port-forward entries"
+
+    # The kernel keys GRE tunnels on (local, remote, key) -- NOT on the
+    # interface name. If another GRE tunnel already uses this exact pair of
+    # endpoints, the add fails with EEXIST and, confusingly, reports the
+    # fallback device "gre0" rather than the name that was asked for.
+    if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        log "ERROR: interface $TUN_NAME was not created."
+        log "  Another GRE tunnel probably already uses $LOCAL_IP -> $REMOTE_IP."
+        log "  Check:  ip -d tunnel show | grep -i gre"
+        continue
+    fi
+
+    ip link set "$TUN_NAME" mtu "$MTU" 2>/dev/null || true
+    ip link set "$TUN_NAME" txqueuelen 2000 2>/dev/null || true
+    ip link set "$TUN_NAME" up
+    ip addr replace "$TUN_LOCAL_CIDR" dev "$TUN_NAME"
+    set_proc "/proc/sys/net/ipv4/conf/$TUN_NAME/rp_filter" 2
+
+    # --------------------------------------------------------- base rules --
+    # GRE (IP protocol 47) from this peer only.
+    ipt filter INPUT -p gre -s "$REMOTE_IP" -m comment --comment "$TAG" -j ACCEPT
+
+    # Clamp MSS so forwarded TCP fits the tunnel MTU without fragmenting.
+    ipt mangle FORWARD -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "$TAG" -j TCPMSS --clamp-mss-to-pmtu
+    ipt mangle FORWARD -i "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "$TAG" -j TCPMSS --clamp-mss-to-pmtu
+
+    # ------------------------------------------- FOREIGN: return routing --
+    if [ "$SIDE" = "FOREIGN" ]; then
+        ANY_FOREIGN=1
+        MARK_HEX="$(printf '0x%x' "$MARK")"
+
+        # Traffic arrives over the tunnel carrying the REAL client source IP.
+        # Without this, replies would leave via the default route straight to
+        # the client and be dropped as unsolicited. Each tunnel gets its own
+        # mark and its own routing table, so a reply can only ever go back out
+        # the tunnel it came in on.
+        ipt mangle PREROUTING -i "$TUN_NAME" -m conntrack --ctstate NEW \
+            -m comment --comment "$TAG" -j CONNMARK --set-mark "$MARK_HEX/$MASK_HEX"
+
+        ip rule show 2>/dev/null | grep -q "fwmark $MARK_HEX.*lookup $RT_TABLE" \
+            || ip rule add fwmark "$MARK_HEX/$MASK_HEX" lookup "$RT_TABLE"
+        ip route replace default via "$TUN_PEER_IP" dev "$TUN_NAME" table "$RT_TABLE"
+
+        log "$TUN_NAME (FOREIGN <- $REMOTE_IP): up, mark $MARK_HEX/$MASK_HEX, table $RT_TABLE"
+    fi
+
+    # ------------------------------------------- IRAN: port forwarding ----
+    if [ "$SIDE" = "IRAN" ]; then
+        n_pf=0
+        if [ -s "$PF_DB" ]; then
+            # Record format: tunnel|proto|public_port|target_port|bind_ip
+            # bind_ip empty -> publish on every public address of this server
+            while IFS='|' read -r t proto lport tport bindip; do
+                [ -n "${t:-}" ] || continue
+                [ "$t" = "$TUN_NAME" ] || continue
+                bindip="${bindip:-}"
+                marker="${PF_TAG}:${TUN_NAME}:${proto}:${lport}:${tport}:${bindip:-all}"
+                n_pf=$((n_pf + 1))
+
+                if [ -n "$bindip" ]; then
+                    ip_list="$bindip"
+                else
+                    ip_list="$(public_ips)"
+                fi
+
+                while IFS= read -r pubip; do
+                    [ -n "$pubip" ] || continue
+                    # DNAT only. No SNAT/MASQUERADE here -- that is what keeps
+                    # the client's real source address intact for the peer.
+                    ipt nat PREROUTING -d "$pubip" -p "$proto" --dport "$lport" \
+                        -m comment --comment "$marker" \
+                        -j DNAT --to-destination "${TUN_PEER_IP}:${tport}"
+                done <<< "$ip_list"
+
+                ipt filter FORWARD -o "$TUN_NAME" -p "$proto" -d "$TUN_PEER_IP" --dport "$tport" \
+                    -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
+                    -m comment --comment "$marker" -j ACCEPT
+                ipt filter FORWARD -i "$TUN_NAME" -p "$proto" -s "$TUN_PEER_IP" \
+                    -m conntrack --ctstate ESTABLISHED,RELATED \
+                    -m comment --comment "$marker" -j ACCEPT
+            done < "$PF_DB"
+        fi
+        log "$TUN_NAME (IRAN -> $REMOTE_IP): up, $n_pf port-forward entries"
+    fi
+done
+
+# Restoring the mark is global, not per tunnel: one pair of rules serves every
+# tunnel because the mark value itself says which table to use. They are
+# tagged :global so removing a single tunnel leaves them alone.
+if [ "$ANY_FOREIGN" -eq 1 ]; then
+    # The mask narrows when the highest-numbered tunnel goes away. Drop any
+    # global rule carrying a different mask first, otherwise the old wider one
+    # stays behind and keeps clobbering mark bits that belong to other tools.
+    for tbl in mangle; do
+        ( iptables-save -t "$tbl" 2>/dev/null || true ) \
+        | grep -- "--comment \"${SYS_TAG}:global\"" \
+        | grep -v -- "--nfmask $MASK_HEX " \
+        | sed -e 's/^-A /-D /' \
+        | while IFS= read -r rule; do
+            [ -n "$rule" ] || continue
+            eval "iptables -t $tbl $rule" 2>/dev/null || true
+          done
+    done
+
+    ipt mangle PREROUTING -m comment --comment "${SYS_TAG}:global" \
+        -j CONNMARK --restore-mark --nfmask "$MASK_HEX" --ctmask "$MASK_HEX"
+    ipt mangle OUTPUT -m comment --comment "${SYS_TAG}:global" \
+        -j CONNMARK --restore-mark --nfmask "$MASK_HEX" --ctmask "$MASK_HEX"
 fi
 
 exit 0
@@ -390,17 +506,11 @@ write_down_script() {
 $HELPER_STAMP
 DOWNSTAMP
     cat >> "$DOWN_SCRIPT" <<'DOWNEOF'
-# Tears the tunnel down. Run by "systemctl stop legendary-gre".
+# Tears every managed tunnel down. Run by "systemctl stop legendary-gre".
 set -uo pipefail
 
 BASE_DIR="/etc/legendary-gre"
-STATE_FILE="$BASE_DIR/state"
-RT_TABLE="100"
-MARK="0x1"
-
-[ -f "$STATE_FILE" ] || exit 0
-# shellcheck disable=SC1090
-. "$STATE_FILE"
+TUN_DIR="$BASE_DIR/tunnels"
 
 for table in filter nat mangle raw; do
     ( iptables-save -t "$table" 2>/dev/null || true ) \
@@ -411,17 +521,27 @@ for table in filter nat mangle raw; do
       done
 done
 
-# Bounded on purpose. An unbounded "while grep; do del; done" spins forever if
-# the delete ever reports success without removing what the grep matched --
-# which is a real risk on a box where something else (WireGuard) also uses
-# fwmark rules.
-for _ in 1 2 3 4 5 6 7 8; do
-    ip rule show 2>/dev/null | grep -q "fwmark $MARK.*lookup $RT_TABLE" || break
-    ip rule del fwmark "$MARK/$MARK" lookup "$RT_TABLE" 2>/dev/null || break
-done
-ip route flush table "$RT_TABLE" 2>/dev/null || true
+shopt -s nullglob
+for CONF in "$TUN_DIR"/*.conf; do
+    TUN_NAME=""; MARK=""; RT_TABLE=""
+    # shellcheck disable=SC1090
+    . "$CONF"
+    [ -n "$TUN_NAME" ] || continue
 
-ip tunnel del "$TUN_NAME" 2>/dev/null || ip link del "$TUN_NAME" 2>/dev/null || true
+    if [ -n "$MARK" ] && [ -n "$RT_TABLE" ]; then
+        MARK_HEX="$(printf '0x%x' "$MARK")"
+        # Bounded on purpose. An unbounded "while grep; do del; done" spins
+        # forever if the delete ever reports success without removing what the
+        # grep matched.
+        for _ in 1 2 3 4 5 6 7 8; do
+            ip rule show 2>/dev/null | grep -q "fwmark $MARK_HEX.*lookup $RT_TABLE" || break
+            ip rule del fwmark "$MARK_HEX" lookup "$RT_TABLE" 2>/dev/null || break
+        done
+        ip route flush table "$RT_TABLE" 2>/dev/null || true
+    fi
+
+    ip tunnel del "$TUN_NAME" 2>/dev/null || ip link del "$TUN_NAME" 2>/dev/null || true
+done
 exit 0
 DOWNEOF
     chmod 700 "$DOWN_SCRIPT"
@@ -430,7 +550,7 @@ DOWNEOF
 write_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Legendary GRE Tunnel (real client IP preserving)
+Description=Legendary GRE Tunnels (real client IP preserving)
 After=network-online.target
 Wants=network-online.target
 
@@ -446,30 +566,84 @@ EOF
     systemctl daemon-reload
 }
 
-save_state() {
-    cat > "$STATE_FILE" <<EOF
-SIDE="$SIDE"
-TUN_NAME="$TUN_NAME"
-LOCAL_IP="$LOCAL_IP"
-REMOTE_IP="$REMOTE_IP"
-TUN_LOCAL_IP="$TUN_LOCAL_IP"
-TUN_PEER_IP="$TUN_PEER_IP"
-TUN_LOCAL_CIDR="$TUN_LOCAL_IP/30"
-MTU="$MTU"
-EXTRA_PUBLIC_IPS="${EXTRA_PUBLIC_IPS:-}"
-EOF
-    chmod 600 "$STATE_FILE"
+# ------------------------------------------------------------- migration ---
+
+# v1.1.x kept a single /etc/legendary-gre/state and a port-forward database
+# with no tunnel column. Convert both, once, so an existing install keeps
+# working after the upgrade without anyone re-entering anything.
+migrate_legacy_state() {
+    [ -f "$LEGACY_STATE" ] || return 0
+
+    clear_tunnel_vars
+    # shellcheck disable=SC1090
+    . "$LEGACY_STATE"
+    if [ -z "${TUN_NAME:-}" ]; then
+        rm -f "$LEGACY_STATE"
+        return 0
+    fi
+
+    echo "[i] Migrating the v1.1 single-tunnel config to the multi-tunnel layout."
+    MARK="${MARK:-1}"
+    RT_TABLE="${RT_TABLE:-100}"
+    MTU="${MTU:-$DEFAULT_MTU}"
+    save_tunnel
+
+    # Port forwards gain a leading tunnel column.
+    if [ -s "$PF_DB" ]; then
+        local tmp
+        tmp="$(mktemp)"
+        awk -F'|' -v t="$TUN_NAME" 'NF {
+            if (NF >= 5) { print $0 }
+            else if (NF == 4) { print t "|" $1 "|" $2 "|" $3 "|" $4 }
+            else if (NF == 3) { print t "|" $1 "|" $2 "|" $3 "|" }
+        }' "$PF_DB" > "$tmp"
+        mv "$tmp" "$PF_DB"
+        chmod 600 "$PF_DB"
+    fi
+
+    rm -f "$LEGACY_STATE"
+    echo "[i] Done: tunnel '$TUN_NAME' is now $TUN_DIR/$TUN_NAME.conf"
+    echo
 }
 
 # ------------------------------------------------------------ create flow ---
 
 create_tunnel() {
-    local detected role iran_ip foreign_ip tun_net base o1 o2 o3 o4 mtu_in extra
+    local detected role iran_ip foreign_ip idx mtu_in extra existing reuse
+    local conflict yn2
 
     echo
     echo "================================================"
-    echo "            Create / Reconfigure"
+    echo "            Add / Reconfigure a tunnel"
     echo "================================================"
+
+    # Reconfigure an existing one, or set up a new one.
+    TUN_NAME=""
+    if [ "$(tunnel_count)" -gt 0 ]; then
+        echo "Configured tunnels:"
+        while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            load_tunnel "$t" && printf "  %-10s %-8s %s <-> %s\n" "$t" "$SIDE" "$LOCAL_IP" "$REMOTE_IP"
+        done < <(tunnel_names)
+        echo
+        read_choice "Reconfigure one of these instead of adding a new tunnel? [y/N]: " reuse
+        if [[ "${reuse:-N}" =~ ^[Yy]$ ]]; then
+            pick_tunnel existing "Tunnel to reconfigure" || return 0
+            TUN_NAME="$existing"
+            load_tunnel "$TUN_NAME"
+            idx="${TUN_NAME#legend}"
+        fi
+    fi
+
+    if [ -z "$TUN_NAME" ]; then
+        if ! idx="$(next_free_index)"; then
+            echo "All $MAX_TUNNELS tunnel slots are in use. Remove one first."
+            return 0
+        fi
+        TUN_NAME="legend$idx"
+    fi
+
+    echo
     echo "1) IRAN server    (clients connect here)"
     echo "2) FOREIGN server (traffic exits here)"
     read_choice "Select server role [1/2]: " role
@@ -500,30 +674,22 @@ create_tunnel() {
         echo
         echo "[!] $LOCAL_IP is NOT configured on any interface of this server."
         [ -n "$detected" ] && echo "    This server appears to be $detected."
-        read_choice "Continue anyway? [y/N]: " yn
-        [[ "${yn:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+        read_choice "Continue anyway? [y/N]: " yn2
+        [[ "${yn2:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
     fi
+
+    # Addressing and isolation follow the slot index, so the operator never has
+    # to pick a subnet, a mark or a routing table by hand.
+    local third=$((10 + idx))
+    if [ "$SIDE" = "IRAN" ]; then
+        TUN_LOCAL_IP="10.10.$third.2"; TUN_PEER_IP="10.10.$third.1"
+    else
+        TUN_LOCAL_IP="10.10.$third.1"; TUN_PEER_IP="10.10.$third.2"
+    fi
+    MARK=$((idx + 1))
+    RT_TABLE=$((100 + idx))
 
     echo
-    read_choice "Tunnel subnet [$DEFAULT_TUN_NET]: " tun_net
-    tun_net="${tun_net:-$DEFAULT_TUN_NET}"
-    base="${tun_net%%/*}"
-    valid_ip "$base" || { echo "Invalid subnet."; return 0; }
-    IFS='.' read -r o1 o2 o3 o4 <<< "$base"
-    if [ "$o4" != "0" ]; then
-        echo "Give the network address of a /30, e.g. 10.10.10.0/30"
-        return 0
-    fi
-    # FOREIGN takes .1 and IRAN takes .2 (same convention as the original).
-    if [ "$SIDE" = "IRAN" ]; then
-        TUN_LOCAL_IP="$o1.$o2.$o3.2"; TUN_PEER_IP="$o1.$o2.$o3.1"
-    else
-        TUN_LOCAL_IP="$o1.$o2.$o3.1"; TUN_PEER_IP="$o1.$o2.$o3.2"
-    fi
-
-    read_choice "Tunnel interface name [$DEFAULT_TUN_NAME]: " TUN_NAME
-    TUN_NAME="${TUN_NAME:-$DEFAULT_TUN_NAME}"
-
     read_choice "Tunnel MTU [$DEFAULT_MTU]: " mtu_in
     MTU="${mtu_in:-$DEFAULT_MTU}"
     [[ "$MTU" =~ ^[0-9]+$ ]] && [ "$MTU" -ge 576 ] && [ "$MTU" -le 9000 ] \
@@ -541,9 +707,7 @@ create_tunnel() {
 
     # A GRE tunnel is identified by its endpoints, not its name. Another tunnel
     # on the same local/remote pair -- typically one left over from a different
-    # script -- makes the kernel refuse this one with EEXIST. Catch it here,
-    # while it is still cheap to fix.
-    local conflict yn2
+    # script -- makes the kernel refuse this one with EEXIST.
     conflict="$(ip -d tunnel show 2>/dev/null \
         | grep -i 'gre' \
         | grep -F "remote $REMOTE_IP" \
@@ -553,8 +717,7 @@ create_tunnel() {
         echo
         echo "[!] Another GRE tunnel already uses these endpoints:"
         printf '      %s\n' "$conflict"
-        echo "    The kernel allows only one GRE tunnel per local/remote pair,"
-        echo "    so this one cannot be created until that one is gone."
+        echo "    The kernel allows only one GRE tunnel per local/remote pair."
         echo
         read_choice "Delete the conflicting tunnel now? [y/N]: " yn2
         if [[ "${yn2:-N}" =~ ^[Yy]$ ]]; then
@@ -569,7 +732,7 @@ create_tunnel() {
         fi
     fi
 
-    save_state
+    save_tunnel
     write_up_script
     write_down_script
     write_service
@@ -577,43 +740,48 @@ create_tunnel() {
     echo
     if "$UP_SCRIPT"; then
         systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-        # Mark the unit active without re-running it, so state matches reality.
         systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
         echo
         echo "================================================"
         echo "                   Configured"
         echo "================================================"
+        echo "Tunnel      : $TUN_NAME   (slot $idx of $MAX_TUNNELS)"
         echo "Role        : $SIDE"
-        echo "Interface   : $TUN_NAME  (MTU $MTU)"
         echo "Local  WAN  : $LOCAL_IP"
         echo "Remote WAN  : $REMOTE_IP"
         echo "Tunnel IP   : $TUN_LOCAL_IP   peer: $TUN_PEER_IP"
+        echo "MTU         : $MTU"
+        if [ "$SIDE" = "FOREIGN" ]; then
+            echo "Return path : fwmark $(printf '0x%x' "$MARK"), routing table $RT_TABLE"
+        fi
         echo "Persistence : enabled ($SERVICE_NAME)"
-        echo "Real IP     : $([ "$SIDE" = "FOREIGN" ] && echo "return routing active" || echo "no SNAT, client IP preserved")"
         echo
         echo "Run the same script on the other server with the other role."
         echo "Then test:  ping -c4 $TUN_PEER_IP"
     else
-        echo "[!] Setup script failed. Nothing was enabled. See the error above."
+        echo "[!] Setup script failed. See the error above."
     fi
 }
 
 # ---------------------------------------------------------------- status ---
 
 show_status() {
-    load_state
     echo
-    echo "================ Tunnel ==========================="
-    if [ -n "${TUN_NAME:-}" ] && ip link show "$TUN_NAME" >/dev/null 2>&1; then
-        ip -d link show "$TUN_NAME" | sed -n '1,3p'
-        ip -br addr show "$TUN_NAME"
+    echo "================ Tunnels =========================="
+    if [ "$(tunnel_count)" -eq 0 ]; then
+        echo "No tunnels configured."
     else
-        echo "No managed tunnel interface is up."
+        printf "%-10s %-8s %-16s %-16s %-14s %s\n" \
+            "Name" "Role" "Local WAN" "Remote WAN" "Tunnel IP" "Link"
+        while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            load_tunnel "$t" || continue
+            local up="DOWN"
+            ip link show "$t" >/dev/null 2>&1 && up="up"
+            printf "%-10s %-8s %-16s %-16s %-14s %s\n" \
+                "$t" "$SIDE" "$LOCAL_IP" "$REMOTE_IP" "$TUN_LOCAL_IP" "$up"
+        done < <(tunnel_names)
     fi
-
-    echo
-    echo "================ Saved config ====================="
-    [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "No saved state."
 
     echo
     echo "================ Service =========================="
@@ -627,43 +795,37 @@ show_status() {
 
     echo
     echo "================ Managed rules ===================="
-    ( iptables-save 2>/dev/null || true ) | grep -- "--comment \"$TAG_PREFIX" \
-        || echo "No managed rules."
+    ( iptables-save 2>/dev/null || true ) | grep -c -- "--comment \"$TAG_PREFIX" \
+        | sed 's/^/rules: /' || echo "rules: 0"
 
-    if [ "${SIDE:-}" = "FOREIGN" ]; then
-        echo
-        echo "================ Return routing ==================="
-        ip rule show 2>/dev/null | grep "lookup 100" || echo "No fwmark rule."
-        ip route show table 100 2>/dev/null || echo "Table 100 empty."
-    fi
+    echo
+    echo "================ Return routing ==================="
+    local any=0
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        load_tunnel "$t" || continue
+        [ "$SIDE" = "FOREIGN" ] || continue
+        any=1
+        printf "  %-10s mark %-6s table %-5s %s\n" "$t" \
+            "$(printf '0x%x' "$MARK")" "$RT_TABLE" \
+            "$(ip route show table "$RT_TABLE" 2>/dev/null | head -1)"
+    done < <(tunnel_names)
+    [ "$any" -eq 1 ] || echo "  (no FOREIGN-side tunnels on this server)"
 }
 
 # -------------------------------------------------------------- diagnose ---
 
 diagnose() {
-    load_state
     local ok="  [ OK ]" bad="  [FAIL]" warn="  [WARN]"
+    local t
 
-    if [ -z "${TUN_NAME:-}" ]; then
-        echo "No saved state. Run option 1 first."
+    if [ "$(tunnel_count)" -eq 0 ]; then
+        echo "No tunnels configured. Use option 1 first."
         return 0
     fi
 
     echo
-    echo "================ Diagnostics ======================"
-
-    if ip link show "$TUN_NAME" >/dev/null 2>&1; then
-        echo "$ok tunnel interface $TUN_NAME exists"
-        ip -d link show "$TUN_NAME" | grep -q "remote $REMOTE_IP" \
-            && echo "$ok remote endpoint is $REMOTE_IP" \
-            || echo "$bad remote endpoint does NOT match $REMOTE_IP"
-        ip -4 -o addr show "$TUN_NAME" | grep -q "$TUN_LOCAL_IP" \
-            && echo "$ok tunnel address $TUN_LOCAL_IP assigned" \
-            || echo "$bad tunnel address $TUN_LOCAL_IP missing"
-    else
-        echo "$bad tunnel interface $TUN_NAME does not exist"
-    fi
-
+    echo "================ Shared checks ===================="
     if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = "1" ]; then
         echo "$ok ip_forward enabled"
     else
@@ -676,7 +838,7 @@ diagnose() {
         && echo "$warn rp_filter=1 (strict) -- can drop real client IPs; 2 is wanted" \
         || echo "$ok rp_filter=$rpf on all"
 
-    # The two rules that historically broke things.
+    # The rules that historically broke things.
     if ( iptables-save -t nat 2>/dev/null || true ) | grep -q '^-A POSTROUTING -j MASQUERADE$'; then
         echo "$bad catch-all MASQUERADE present -- this REWRITES every client IP"
         echo "       remove with: iptables -t nat -D POSTROUTING -j MASQUERADE"
@@ -689,43 +851,59 @@ diagnose() {
         echo "$ok no catch-all DNAT"
     fi
     if ( iptables-save -t filter 2>/dev/null || true ) | grep -qE '^-A INPUT -p icmp -j DROP$'; then
-        echo "$warn blanket 'DROP icmp' present -- ping through the tunnel will fail"
+        echo "$warn blanket 'DROP icmp' present -- ping through a tunnel will fail"
     fi
 
-    if [ "${SIDE:-}" = "FOREIGN" ]; then
-        ip rule show 2>/dev/null | grep -q "lookup 100" \
-            && echo "$ok fwmark policy rule present" \
-            || echo "$bad fwmark policy rule MISSING -- replies will not return via tunnel"
-        ip route show table 100 2>/dev/null | grep -q "default" \
-            && echo "$ok route table 100 has a default via the tunnel" \
-            || echo "$bad route table 100 has no default route"
-        ( iptables-save -t mangle 2>/dev/null || true ) | grep -q "CONNMARK --set-xmark\|CONNMARK --save-mark\|--set-mark" \
-            && echo "$ok CONNMARK marking rules present" \
-            || echo "$bad CONNMARK rules missing"
-    fi
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        load_tunnel "$t" || continue
+        echo
+        echo "================ $t ($SIDE) ==================="
 
-    if [ "${SIDE:-}" = "IRAN" ]; then
-        local n
-        # note the space after $( : "$((" would start an arithmetic expansion
-        n="$( ( iptables-save -t nat 2>/dev/null || true ) | grep -c "\"$PF_TAG" || true )"
-        echo "$ok $n port-forward DNAT rules installed"
-    fi
+        if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+            echo "$ok interface exists"
+            ip -d link show "$TUN_NAME" | grep -q "remote $REMOTE_IP" \
+                && echo "$ok remote endpoint is $REMOTE_IP" \
+                || echo "$bad remote endpoint does NOT match $REMOTE_IP"
+            ip -4 -o addr show "$TUN_NAME" | grep -q "$TUN_LOCAL_IP" \
+                && echo "$ok tunnel address $TUN_LOCAL_IP assigned" \
+                || echo "$bad tunnel address $TUN_LOCAL_IP missing"
+        else
+            echo "$bad interface $TUN_NAME does not exist"
+        fi
 
-    echo
-    echo "---- peer reachability ----"
-    if ping -c 2 -W 2 "$TUN_PEER_IP" >/dev/null 2>&1; then
-        echo "$ok peer $TUN_PEER_IP answers ping"
-    else
-        echo "$warn peer $TUN_PEER_IP does not answer ping"
-        echo "       Either the other side is not configured yet, or GRE"
-        echo "       (IP protocol 47) is blocked by the provider firewall,"
-        echo "       or the peer drops ICMP. Try a TCP test instead:"
-        echo "         nc -zv $TUN_PEER_IP 22"
-    fi
+        if [ "$SIDE" = "FOREIGN" ]; then
+            local mh
+            mh="$(printf '0x%x' "$MARK")"
+            ip rule show 2>/dev/null | grep -q "fwmark $mh.*lookup $RT_TABLE" \
+                && echo "$ok fwmark $mh -> table $RT_TABLE" \
+                || echo "$bad fwmark rule MISSING -- replies will not return via this tunnel"
+            ip route show table "$RT_TABLE" 2>/dev/null | grep -q "default" \
+                && echo "$ok table $RT_TABLE has a default route" \
+                || echo "$bad table $RT_TABLE has no default route"
+            ( iptables-save -t mangle 2>/dev/null || true ) | grep -q "${SYS_TAG}:${TUN_NAME}" \
+                && echo "$ok CONNMARK marking rule present" \
+                || echo "$bad CONNMARK rule missing"
+        fi
 
-    echo
-    echo "---- load ----"
+        if [ "$SIDE" = "IRAN" ]; then
+            local n
+            n="$( ( iptables-save -t nat 2>/dev/null || true ) | grep -c "\"$PF_TAG:$TUN_NAME:" || true )"
+            echo "$ok $n port-forward DNAT rules"
+        fi
+
+        if ping -c 2 -W 2 "$TUN_PEER_IP" >/dev/null 2>&1; then
+            echo "$ok peer $TUN_PEER_IP answers ping"
+        else
+            echo "$warn peer $TUN_PEER_IP does not answer ping"
+            echo "       Either the other side is not configured yet, or GRE"
+            echo "       (IP protocol 47) is blocked by the provider firewall."
+            echo "       TCP test instead:  nc -zv $TUN_PEER_IP 22"
+        fi
+    done < <(tunnel_names)
+
     if [ -r /proc/sys/net/netfilter/nf_conntrack_count ]; then
+        echo
         echo "conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
     fi
 }
@@ -733,17 +911,17 @@ diagnose() {
 # ---------------------------------------------------------- port forwards ---
 
 list_port_forwards() {
-    load_state
     echo
     echo "================ Saved port forwards =============="
     if [ -s "$PF_DB" ]; then
-        printf "%-4s %-8s %-14s %-14s %s\n" "#" "Proto" "Public port" "Target port" "Bound to"
+        printf "%-4s %-10s %-8s %-14s %-14s %s\n" \
+            "#" "Tunnel" "Proto" "Public port" "Target port" "Bound to"
         local i=0
-        while IFS='|' read -r proto lport tport bindip; do
-            [ -n "${proto:-}" ] || continue
+        while IFS='|' read -r t proto lport tport bindip; do
+            [ -n "${t:-}" ] || continue
             i=$((i + 1))
-            printf "%-4s %-8s %-14s %-14s %s\n" \
-                "$i" "$proto" "$lport" "$tport" "${bindip:-all public IPs}"
+            printf "%-4s %-10s %-8s %-14s %-14s %s\n" \
+                "$i" "$t" "$proto" "$lport" "$tport" "${bindip:-all public IPs}"
         done < "$PF_DB"
     else
         echo "None."
@@ -755,19 +933,23 @@ list_port_forwards() {
 }
 
 add_port_forward() {
-    load_state
-    if [ "${SIDE:-}" != "IRAN" ]; then
-        echo "Port forwards are configured on the IRAN server."
+    local tun lport tport proto_sel bindip ip_sel n yn
+
+    pick_tunnel tun "Tunnel to forward into" || return 0
+    load_tunnel "$tun" || return 0
+
+    if [ "$SIDE" != "IRAN" ]; then
+        echo "Port forwards are configured on the IRAN side of a tunnel."
+        echo "'$tun' is the $SIDE side here."
         return 0
     fi
-    if ! ip link show "${TUN_NAME:-none}" >/dev/null 2>&1; then
-        echo "Tunnel is not up."
+    if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        echo "Tunnel $TUN_NAME is not up."
         return 0
     fi
 
-    local lport tport proto_sel bindip ip_sel n
     echo
-    read_choice "Public port on the IRAN server: " lport
+    read_choice "Public port on this server: " lport
     valid_port "$lport" || { echo "Invalid port."; return 0; }
 
     if [ "$lport" = "22" ]; then
@@ -829,13 +1011,13 @@ add_port_forward() {
 
     local p
     for p in "${protos[@]}"; do
-        grep -Fxq "${p}|${lport}|${tport}|${bindip}" "$PF_DB" \
-            || echo "${p}|${lport}|${tport}|${bindip}" >> "$PF_DB"
+        grep -Fxq "${tun}|${p}|${lport}|${tport}|${bindip}" "$PF_DB" \
+            || echo "${tun}|${p}|${lport}|${tport}|${bindip}" >> "$PF_DB"
     done
 
     "$UP_SCRIPT" >/dev/null
     echo
-    echo "[+] Forwarding ${protos[*]} ${lport} -> ${TUN_PEER_IP}:${tport}"
+    echo "[+] $tun: forwarding ${protos[*]} ${lport} -> ${TUN_PEER_IP}:${tport}"
     if [ -n "$bindip" ]; then
         echo "[i] Published on $bindip only. Other addresses of this server are untouched."
     else
@@ -846,7 +1028,6 @@ add_port_forward() {
 }
 
 delete_port_forward() {
-    load_state
     list_port_forwards
     echo
     local sel tmp total
@@ -856,8 +1037,8 @@ delete_port_forward() {
         return 0
     fi
 
-    # Deleting by line number, not by port: the same port can now be published
-    # on two different addresses, so a port alone is no longer unique.
+    # Deleting by line number, not by port: the same port can be published on
+    # two addresses and on two different tunnels, so a port is not unique.
     read_choice "Entry number to remove [1-$total]: " sel
     if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "$total" ]; then
         echo "Invalid entry number."
@@ -869,7 +1050,6 @@ delete_port_forward() {
     mv "$tmp" "$PF_DB"
     chmod 600 "$PF_DB"
 
-    # Drop every managed forward rule, then re-apply what remains.
     remove_tagged_rules "$PF_TAG"
     "$UP_SCRIPT" >/dev/null
     echo "[+] Removed entry $sel."
@@ -909,9 +1089,13 @@ port_forward_menu() {
 # ------------------------------------------------------------ mtu / speed ---
 
 tools_menu() {
-    load_state
-    if [ -z "${TUN_NAME:-}" ] || ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
-        echo "Tunnel is not up."
+    local tun sel m best payload
+
+    pick_tunnel tun "Tunnel to work on" || return 0
+    load_tunnel "$tun" || return 0
+
+    if ! ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        echo "Tunnel $TUN_NAME is not up."
         return 0
     fi
 
@@ -924,17 +1108,16 @@ tools_menu() {
 
     case "$sel" in
         1)
-            local m
             read_choice "New MTU: " m
             [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -ge 576 ] && [ "$m" -le 9000 ] \
                 || { echo "Invalid MTU."; return 0; }
             ip link set "$TUN_NAME" mtu "$m"
-            sed -i "s/^MTU=.*/MTU=\"$m\"/" "$STATE_FILE"
+            sed -i "s/^MTU=.*/MTU=\"$m\"/" "$TUN_DIR/$TUN_NAME.conf"
             echo "[+] MTU set to $m and saved."
             ;;
         2)
             install_if_missing iputils-ping ping || return 0
-            local best="" payload
+            best=""
             echo
             printf "%-8s %s\n" "MTU" "Result"
             for m in 1476 1460 1440 1420 1400 1380 1360 1320 1280; do
@@ -949,13 +1132,13 @@ tools_menu() {
             done
             if [ -n "$best" ]; then
                 ip link set "$TUN_NAME" mtu "$best"
-                sed -i "s/^MTU=.*/MTU=\"$best\"/" "$STATE_FILE"
+                sed -i "s/^MTU=.*/MTU=\"$best\"/" "$TUN_DIR/$TUN_NAME.conf"
                 echo
                 echo "[+] Best MTU: $best (applied and saved)"
             else
                 echo
                 echo "[!] No MTU passed. Is the peer up?"
-                ip link set "$TUN_NAME" mtu "${MTU:-1476}" 2>/dev/null || true
+                ip link set "$TUN_NAME" mtu "${MTU:-$DEFAULT_MTU}" 2>/dev/null || true
             fi
             ;;
         3)
@@ -980,12 +1163,58 @@ tools_menu() {
 
 # ----------------------------------------------------------------- remove ---
 
-remove_everything() {
+remove_one_tunnel() {
+    local tun yn tmp
+    pick_tunnel tun "Tunnel to remove" || return 0
+
     echo
-    read_choice "Remove the tunnel, all rules and the service? [y/N]: " yn
+    read_choice "Remove tunnel '$tun' and its rules? [y/N]: " yn
     [[ "${yn:-N}" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
 
-    load_state
+    load_tunnel "$tun" || return 0
+
+    # Scoped tags, so the other tunnels on this server are untouched.
+    remove_tagged_rules "${SYS_TAG}:${tun}"
+    remove_tagged_rules "${PF_TAG}:${tun}:"
+
+    if [ -n "${MARK:-}" ] && [ -n "${RT_TABLE:-}" ]; then
+        local mh
+        mh="$(printf '0x%x' "$MARK")"
+        for _ in 1 2 3 4 5 6 7 8; do
+            ip rule show 2>/dev/null | grep -q "fwmark $mh.*lookup $RT_TABLE" || break
+            ip rule del fwmark "$mh" lookup "$RT_TABLE" 2>/dev/null || break
+        done
+        ip route flush table "$RT_TABLE" 2>/dev/null || true
+    fi
+
+    ip tunnel del "$tun" 2>/dev/null || ip link del "$tun" 2>/dev/null || true
+
+    tmp="$(mktemp)"
+    awk -F'|' -v t="$tun" '$1 != t' "$PF_DB" > "$tmp"
+    mv "$tmp" "$PF_DB"
+    chmod 600 "$PF_DB"
+
+    rm -f "$TUN_DIR/$tun.conf"
+
+    if [ "$(tunnel_count)" -gt 0 ]; then
+        "$UP_SCRIPT" >/dev/null 2>&1 || true
+        echo "[+] Removed $tun. $(tunnel_count) tunnel(s) still configured."
+    else
+        # Last one out: the shared restore-mark rules have nothing left to serve.
+        remove_tagged_rules "${SYS_TAG}:global"
+        systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+        rm -f "$SERVICE_FILE" "$UP_SCRIPT" "$DOWN_SCRIPT"
+        systemctl daemon-reload
+        systemctl reset-failed >/dev/null 2>&1 || true
+        echo "[+] Removed $tun. No tunnels left; service removed too."
+    fi
+}
+
+remove_everything() {
+    local yn
+    echo
+    read_choice "Remove ALL tunnels, rules and the service? [y/N]: " yn
+    [[ "${yn:-N}" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
 
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE"
@@ -994,20 +1223,26 @@ remove_everything() {
 
     remove_tagged_rules "$TAG_PREFIX"
 
-    # bounded, same reasoning as in the down script
-    for _ in 1 2 3 4 5 6 7 8; do
-        ip rule show 2>/dev/null | grep -q "fwmark 0x1.*lookup 100" || break
-        ip rule del fwmark 0x1/0x1 lookup 100 2>/dev/null || break
-    done
-    ip route flush table 100 2>/dev/null || true
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        load_tunnel "$t" || continue
+        if [ -n "${MARK:-}" ] && [ -n "${RT_TABLE:-}" ]; then
+            local mh
+            mh="$(printf '0x%x' "$MARK")"
+            for _ in 1 2 3 4 5 6 7 8; do
+                ip rule show 2>/dev/null | grep -q "fwmark $mh.*lookup $RT_TABLE" || break
+                ip rule del fwmark "$mh" lookup "$RT_TABLE" 2>/dev/null || break
+            done
+            ip route flush table "$RT_TABLE" 2>/dev/null || true
+        fi
+        ip tunnel del "$t" 2>/dev/null || ip link del "$t" 2>/dev/null || true
+    done < <(tunnel_names)
 
-    if [ -n "${TUN_NAME:-}" ]; then
-        ip tunnel del "$TUN_NAME" 2>/dev/null || ip link del "$TUN_NAME" 2>/dev/null || true
-    fi
-
-    rm -f "$UP_SCRIPT" "$DOWN_SCRIPT" "$STATE_FILE"
+    rm -f "$UP_SCRIPT" "$DOWN_SCRIPT" "$LEGACY_STATE"
+    rm -f "$TUN_DIR"/*.conf 2>/dev/null || true
     : > "$PF_DB"
 
+    clear_tunnel_vars
     echo "[+] Removed."
     echo "[i] ip_forward and rp_filter were left as they are; other services may need them."
 }
@@ -1015,33 +1250,42 @@ remove_everything() {
 # ------------------------------------------------------------------- menu ---
 
 main_menu() {
+    local sel n
     while true; do
         echo
         echo "================================================"
         echo "      Legendary GRE Tunnel Manager  v$VERSION"
         echo "      (real client IP preserving)"
         echo "================================================"
-        load_state
-        if [ -n "${SIDE:-}" ]; then
-            echo "  role: $SIDE   iface: ${TUN_NAME:-?}   peer: ${TUN_PEER_IP:-?}"
+        n="$(tunnel_count)"
+        if [ "$n" -gt 0 ]; then
+            while IFS= read -r t; do
+                [ -n "$t" ] || continue
+                load_tunnel "$t" || continue
+                printf "  %-10s %-8s peer %-14s %s\n" \
+                    "$t" "$SIDE" "$TUN_PEER_IP" \
+                    "$(ip link show "$t" >/dev/null 2>&1 && echo up || echo DOWN)"
+            done < <(tunnel_names)
             echo "------------------------------------------------"
         fi
-        echo "1) Create / Reconfigure tunnel"
+        echo "1) Add / reconfigure a tunnel"
         echo "2) Show status"
         echo "3) Diagnose"
         echo "4) Port forward manager"
         echo "5) MTU / speed tools"
-        echo "6) Remove everything"
+        echo "6) Remove one tunnel"
+        echo "7) Remove everything"
         echo "0) Exit"
         echo
-        read_choice "Select [0-6]: " sel
+        read_choice "Select [0-7]: " sel
         case "$sel" in
             1) create_tunnel || true; pause ;;
             2) show_status || true; pause ;;
             3) diagnose || true; pause ;;
             4) port_forward_menu || true ;;
             5) tools_menu || true; pause ;;
-            6) remove_everything || true; pause ;;
+            6) remove_one_tunnel || true; pause ;;
+            7) remove_everything || true; pause ;;
             0) exit 0 ;;
             "") echo "Nothing entered." ;;
             *) printf 'Invalid selection: %q\n' "$sel" ;;
@@ -1051,10 +1295,9 @@ main_menu() {
 
 # An upgrade only replaces this file. The helper scripts it generated live in
 # /usr/local/sbin and keep whatever logic the old version wrote, so a new
-# feature here would silently run against old logic there. Refresh them before
-# the menu opens if their stamp does not match this version.
+# feature here would silently run against old logic there.
 ensure_helpers_current() {
-    [ -f "$STATE_FILE" ] || return 0
+    [ "$(tunnel_count)" -gt 0 ] || return 0
 
     local stale=0
     grep -qxF "$HELPER_STAMP" "$UP_SCRIPT" 2>/dev/null || stale=1
@@ -1067,12 +1310,13 @@ ensure_helpers_current() {
     write_service
     systemctl daemon-reload >/dev/null 2>&1 || true
     if "$UP_SCRIPT" >/dev/null 2>&1; then
-        echo "[i] Done. Existing tunnel and port-forwards re-applied."
+        echo "[i] Done. Existing tunnels and port-forwards re-applied."
     else
         echo "[!] Regenerated, but re-applying failed. Run option 3 (Diagnose)."
     fi
     echo
 }
 
+migrate_legacy_state
 ensure_helpers_current
 main_menu
