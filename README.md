@@ -284,6 +284,11 @@ sudo ./legendary-gre.sh
 
 ## Changelog
 
+**v1.2.1**
+- Adding a *second* tunnel failed with `idx: unbound variable`. Listing the existing tunnels calls `load_tunnel`, which repopulated `TUN_NAME`, so the "new or existing?" decision always saw a tunnel and skipped the slot allocation. The choice is tracked in its own variable now.
+- `ip rule` entries are matched and deleted by the mark spec actually stored, not a rebuilt one. The mask changes as tunnels come and go, and `ip rule del` only matches when mark *and* mask are given exactly — so a stale narrow-mask rule could survive and, with three or more tunnels, send one tunnel's replies down another's table.
+- Fixed a `pipefail` abort in the rule cleanup that left the tunnel's config file behind when removing a single tunnel.
+
 **v1.2.0**
 - Multiple tunnels per server, up to 8. One foreign server can now terminate tunnels from several Iran servers at once. Each tunnel gets its own interface, `/30`, firewall mark and routing table, allocated from its slot, so return traffic can never leave through the wrong tunnel.
 - State moved from a single `/etc/legendary-gre/state` to one file per tunnel under `/etc/legendary-gre/tunnels/`. Existing v1.1.x installs are migrated automatically on first run, port forwards included.
